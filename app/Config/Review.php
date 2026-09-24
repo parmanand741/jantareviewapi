@@ -39,6 +39,7 @@ class Review extends BaseConfig
         'platforms' => 'Plateforms',
         'suggestions' => 'Suggestions',
         'rateLimits' => 'Rate_Limits',
+        'votes' => 'Votes',
     ];
     public int $unpublishThreshold = -15;
     public int $rescueThreshold = -10;
@@ -47,6 +48,7 @@ class Review extends BaseConfig
     public int $reportCooldownSeconds = 3600;
     public int $submitPerHour = 20;
     public int $reportPerHour = 30;
+    public int $votePerHour = 10;
     public int $reviewPlainMaxLen = 500;
     public int $reviewEncMaxLen = 16000;
     public int $productNameMaxLen = 200;
@@ -92,6 +94,7 @@ class Review extends BaseConfig
         $this->reportCooldownSeconds = (int) env('REVIEW_REPORT_COOLDOWN_SECONDS', 3600);
         $this->submitPerHour = (int) env('REVIEW_SUBMIT_PER_HOUR', 20);
         $this->reportPerHour = (int) env('REVIEW_REPORT_PER_HOUR', 30);
+        $this->votePerHour = (int) env('REVIEW_VOTE_PER_HOUR', 10);
         $this->reviewPlainMaxLen = (int) env('REVIEW_PLAIN_MAX_LEN', 500);
         $this->reviewEncMaxLen = (int) env('REVIEW_ENCRYPTED_MAX_LEN', 16000);
         $this->productNameMaxLen = (int) env('REVIEW_PRODUCT_NAME_MAX_LEN', 200);

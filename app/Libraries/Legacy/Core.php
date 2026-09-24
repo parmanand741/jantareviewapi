@@ -40,6 +40,7 @@ final class Config
             'report_cooldown_seconds' => $config->reportCooldownSeconds,
             'submit_per_hour' => $config->submitPerHour,
             'report_per_hour' => $config->reportPerHour,
+            'vote_per_hour' => $config->votePerHour,
             'review_plain_max_len' => $config->reviewPlainMaxLen,
             'review_enc_max_len' => $config->reviewEncMaxLen,
             'product_name_max_len' => $config->productNameMaxLen,

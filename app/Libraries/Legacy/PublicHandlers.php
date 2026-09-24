@@ -218,98 +218,149 @@ final class PublicHandlers
             Response::error('Missing parameters.');
         }
 
-        $sheet = Sheets::sheetName('reviews');
-        $data  = Sheets::read($sheet, 'A2:P');
+        // A Turnstile challenge is now mandatory for BOTH vote directions;
+        // previously "helpful" was completely unguarded.
+        $ts = Turnstile::verify($token, 'vote_' . $voteType);
+        if (!$ts['ok']) Response::error('Verification failed (' . $ts['reason'] . ').');
 
-        $idx = null;
-        foreach ($data as $i => $r) if (($r[0] ?? '') === $reviewId) {
-            $idx = $i;
-            break;
+        if (!RateLimit::checkHourly('vote', $req->submitterToken, (int) Config::get('vote_per_hour', 10))) {
+            Response::error('Too many votes from this device recently. Please try again later.', 429);
         }
-        if ($idx === null) Response::error('Review not found.');
 
-        $row = $data[$idx];
-        $rowNum = $idx + 2;
+        service('session');
+        $voterKey = hash_hmac(
+            'sha256',
+            'vote|' . $reviewId . '|' . session_id() . '|' . $req->submitterToken,
+            (string) Config::get('encryption_key')
+        );
 
-        // Per-entry cooldown
-        $lastVote = $row[12] ?? '';
-        if ($lastVote !== '') {
-            $t = strtotime((string)$lastVote);
-            if ($t !== false && (time() - $t) < (int) Config::get('vote_cooldown_seconds')) {
-                Response::error('A vote was just recorded. Please wait before voting again.');
+        $sheet     = Sheets::sheetName('reviews');
+        $voteSheet = Sheets::sheetName('votes');
+        Sheets::ensureSheet($voteSheet, ['vote_key', 'review_id', 'vote_type', 'voted_at']);
+
+        // Serialize everything below per review: closes the read-modify-write
+        // race on the counters and on duplicate-vote detection.
+        $lock = self::voteLock($reviewId);
+        if ($lock === false) Response::error('Vote is busy. Please retry shortly.', 503);
+
+        try {
+            foreach (Sheets::read($voteSheet, 'A2:D') as $v) {
+                if ((string) ($v[0] ?? '') === $voterKey && (string) ($v[1] ?? '') === $reviewId) {
+                    Response::json([
+                        'success' => false,
+                        'error' => 'You have already voted on this review.',
+                        'alreadyVoted' => true,
+                    ], 409);
+                }
             }
-        }
 
-        if ($voteType === 'not_helpful') {
-            $ts = Turnstile::verify($token, 'vote_not_helpful');
-            if (!$ts['ok']) Response::error('Verification failed (' . $ts['reason'] . ').');
-        }
+            $data = Sheets::read($sheet, 'A2:P');
+            $idx = null;
+            foreach ($data as $i => $r) if (($r[0] ?? '') === $reviewId) {
+                $idx = $i;
+                break;
+            }
+            if ($idx === null) Response::error('Review not found.');
 
-        $helpful    = (int)($row[6] ?? 0);
-        $notHelpful = (int)($row[7] ?? 0);
-        $status     = Validator::status($row[9] ?? '');
-        $reportCount = (int)($row[10] ?? 0);
+            $row = $data[$idx];
+            $rowNum = $idx + 2;
 
-        if ($voteType === 'helpful') $helpful++;
-        else $notHelpful++;
+            // Per-entry cooldown
+            $lastVote = $row[12] ?? '';
+            if ($lastVote !== '') {
+                $t = strtotime((string)$lastVote);
+                if ($t !== false && (time() - $t) < (int) Config::get('vote_cooldown_seconds')) {
+                    Response::error('A vote was just recorded. Please wait before voting again.');
+                }
+            }
 
-        $netScore = $helpful - $notHelpful;
-        $changed = false;
+            $helpful    = (int)($row[6] ?? 0);
+            $notHelpful = (int)($row[7] ?? 0);
+            $status     = Validator::status($row[9] ?? '');
+            $reportCount = (int)($row[10] ?? 0);
 
-        if ($status === 'published' && $netScore <= (int) Config::get('unpublish_threshold')) {
-            $status = 'archived';
-            $changed = true;
-            Audit::log([
-                'reviewId' => $reviewId,
-                'productName' => (string)($row[11] ?? ''),
-                'productUrl' => (string)($row[2] ?? ''),
-                'stars' => (int)($row[4] ?? 0),
-                'reviewText' => mb_substr(Crypto::decrypt((string)($row[5] ?? '')), 0, 240),
-                'reportCount' => $reportCount,
-                'actionType' => 'archived',
-                'actor' => 'community',
-                'reason' => 'Net Score reached ' . $netScore,
-                'contentHash' => (string)($row[14] ?? ''),
+            if ($voteType === 'helpful') $helpful++;
+            else $notHelpful++;
+
+            $netScore = $helpful - $notHelpful;
+            $changed = false;
+
+            if ($status === 'published' && $netScore <= (int) Config::get('unpublish_threshold')) {
+                $status = 'archived';
+                $changed = true;
+                Audit::log([
+                    'reviewId' => $reviewId,
+                    'productName' => (string)($row[11] ?? ''),
+                    'productUrl' => (string)($row[2] ?? ''),
+                    'stars' => (int)($row[4] ?? 0),
+                    'reviewText' => mb_substr(Crypto::decrypt((string)($row[5] ?? '')), 0, 240),
+                    'reportCount' => $reportCount,
+                    'actionType' => 'archived',
+                    'actor' => 'community',
+                    'reason' => 'Net Score reached ' . $netScore,
+                    'contentHash' => (string)($row[14] ?? ''),
+                ]);
+            } elseif (
+                $status === 'archived'
+                && $netScore >= (int) Config::get('rescue_threshold')
+                && $reportCount < (int) Config::get('report_ceiling')
+            ) {
+                $status = 'published';
+                $changed = true;
+                Audit::log([
+                    'reviewId' => $reviewId,
+                    'productName' => (string)($row[11] ?? ''),
+                    'productUrl' => (string)($row[2] ?? ''),
+                    'stars' => (int)($row[4] ?? 0),
+                    'reviewText' => mb_substr(Crypto::decrypt((string)($row[5] ?? '')), 0, 240),
+                    'reportCount' => $reportCount,
+                    'actionType' => 'rescued',
+                    'actor' => 'community',
+                    'reason' => 'Net Score recovered to ' . $netScore,
+                    'contentHash' => (string)($row[14] ?? ''),
+                ]);
+            }
+
+            // Ledger entry: one row per (voter, review). Permanent — pruning it
+            // would silently re-open the vote, which is the whole point.
+            Sheets::append($voteSheet, [$voterKey, $reviewId, $voteType, time()], 'RAW');
+
+            // Write G, H, I, J, M back
+            Sheets::batchWrite($sheet, [
+                ['range' => "G{$rowNum}:H{$rowNum}", 'values' => [[$helpful, $notHelpful]]],
+                ['range' => "I{$rowNum}", 'values' => [[$netScore]]],
+                ['range' => "J{$rowNum}", 'values' => [[$status]]],
+                ['range' => "M{$rowNum}", 'values' => [[Time::nowIso()]]],
             ]);
-        } elseif (
-            $status === 'archived'
-            && $netScore >= (int) Config::get('rescue_threshold')
-            && $reportCount < (int) Config::get('report_ceiling')
-        ) {
-            $status = 'published';
-            $changed = true;
-            Audit::log([
-                'reviewId' => $reviewId,
-                'productName' => (string)($row[11] ?? ''),
-                'productUrl' => (string)($row[2] ?? ''),
-                'stars' => (int)($row[4] ?? 0),
-                'reviewText' => mb_substr(Crypto::decrypt((string)($row[5] ?? '')), 0, 240),
-                'reportCount' => $reportCount,
-                'actionType' => 'rescued',
-                'actor' => 'community',
-                'reason' => 'Net Score recovered to ' . $netScore,
-                'contentHash' => (string)($row[14] ?? ''),
+
+            Response::ok([
+                'helpful' => $helpful,
+                'notHelpful' => $notHelpful,
+                'netScore' => $netScore,
+                'status' => $status,
+                'statusChanged' => $changed,
+                'message' => $changed
+                    ? ($status === 'archived' ? 'Entry archived by community.' : '🎉 Entry rescued by community!')
+                    : 'Vote recorded.',
             ]);
+        } finally {
+            flock($lock, LOCK_UN);
+            fclose($lock);
         }
+    }
 
-        // Write G, H, I, J, M back
-        Sheets::batchWrite($sheet, [
-            ['range' => "G{$rowNum}:H{$rowNum}", 'values' => [[$helpful, $notHelpful]]],
-            ['range' => "I{$rowNum}", 'values' => [[$netScore]]],
-            ['range' => "J{$rowNum}", 'values' => [[$status]]],
-            ['range' => "M{$rowNum}", 'values' => [[Time::nowIso()]]],
-        ]);
-
-        Response::ok([
-            'helpful' => $helpful,
-            'notHelpful' => $notHelpful,
-            'netScore' => $netScore,
-            'status' => $status,
-            'statusChanged' => $changed,
-            'message' => $changed
-                ? ($status === 'archived' ? 'Entry archived by community.' : '🎉 Entry rescued by community!')
-                : 'Vote recorded.',
-        ]);
+    /** @return resource|false Exclusive per-review mutex; carries no state. */
+    private static function voteLock(string $reviewId)
+    {
+        $dir = (string) Config::get('storage_path');
+        if (!is_dir($dir)) @mkdir($dir, 0750, true);
+        $handle = @fopen($dir . '/vote_' . hash('sha256', $reviewId) . '.lock', 'c');
+        if ($handle === false) return false;
+        if (!flock($handle, LOCK_EX)) {
+            fclose($handle);
+            return false;
+        }
+        return $handle;
     }
 
     public static function report(Request $req): never

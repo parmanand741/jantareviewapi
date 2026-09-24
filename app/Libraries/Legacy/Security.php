@@ -159,6 +159,7 @@ final class RateLimit
             'report' => 3600,
             'suggestion' => 3600,
             'admin_fail' => 3600,
+            'vote' => 3600,
         ];
     }
 
