@@ -22,11 +22,8 @@ class Review extends BaseConfig
     public bool $exposeErrors = false;
     public string $otpFromEmail = '';
     public string $otpFromName = 'JantaReview';
-    public string $otpSmtpHost = '';
-    public int $otpSmtpPort = 587;
-    public string $otpSmtpUser = '';
-    public string $otpSmtpPass = '';
-    public string $otpSmtpCrypto = 'tls';
+    public string $brevoApiKey = '';
+    public string $brevoApiUrl = 'https://api.brevo.com/v3/smtp/email';
     public int $otpTtlSeconds = 600;
     public int $otpMaxAttempts = 5;
     public int $otpRequestPerDay = 3;
@@ -80,11 +77,10 @@ class Review extends BaseConfig
         $this->exposeErrors = filter_var(env('REVIEW_EXPOSE_ERRORS', false), FILTER_VALIDATE_BOOLEAN);
         $this->otpFromEmail = (string) env('OTP_FROM_EMAIL', '');
         $this->otpFromName = (string) env('OTP_FROM_NAME', 'JantaReview');
-        $this->otpSmtpHost = (string) env('OTP_SMTP_HOST', '');
-        $this->otpSmtpPort = (int) env('OTP_SMTP_PORT', 587);
-        $this->otpSmtpUser = (string) env('OTP_SMTP_USER', '');
-        $this->otpSmtpPass = (string) env('OTP_SMTP_PASS', '');
-        $this->otpSmtpCrypto = strtolower((string) env('OTP_SMTP_CRYPTO', 'tls'));
+        // Render's free plan blocks outbound SMTP (25/465/587), so OTP mail goes
+        // to Brevo over HTTPS instead of straight to an SMTP relay.
+        $this->brevoApiKey = (string) env('BREVO_API_KEY', '');
+        $this->brevoApiUrl = (string) env('BREVO_API_URL', 'https://api.brevo.com/v3/smtp/email');
         $this->otpTtlSeconds = (int) env('OTP_TTL_SECONDS', 600);
         $this->otpMaxAttempts = (int) env('OTP_MAX_ATTEMPTS', 5);
         $this->otpRequestPerDay = (int) env('OTP_REQUESTS_PER_DAY', 3);

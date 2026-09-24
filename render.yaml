@@ -47,19 +47,13 @@ services:
       - key: REVIEW_EXPOSE_ERRORS
         value: "false"
 
-      # ---- OTP / SMTP (non-secret parts) --------------------------------
+      # ---- OTP mail (non-secret parts) ----------------------------------
+      # Render's free plan blocks outbound SMTP (25/465/587), so codes are
+      # delivered through Brevo's HTTPS API; only the sender identity is set here.
       - key: OTP_FROM_EMAIL
         value: noreply@jantareview.com
       - key: OTP_FROM_NAME
         value: JantaReview
-      - key: OTP_SMTP_HOST
-        value: smtp.gmail.com
-      - key: OTP_SMTP_PORT
-        value: "587"
-      - key: OTP_SMTP_USER
-        value: parmanand741@gmail.com
-      - key: OTP_SMTP_CRYPTO
-        value: tls
       - key: OTP_TTL_SECONDS
         value: "600"
       - key: OTP_MAX_ATTEMPTS
@@ -94,5 +88,5 @@ services:
         sync: false
       - key: TURNSTILE_SECRET
         sync: false
-      - key: OTP_SMTP_PASS
+      - key: BREVO_API_KEY
         sync: false

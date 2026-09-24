@@ -147,7 +147,13 @@ class Logger extends BaseConfig
             * The message type where the error should go. Can be 0 or 4, or use the
             * class constants: `ErrorlogHandler::TYPE_OS` (0) or `ErrorlogHandler::TYPE_SAPI` (4)
             */
-            'messageType' => 0,
+            /*
+             * 4 = the SAPI error stream, which for this image is the container's
+             * stderr that Render captures. 0 would follow the error_log ini
+             * target (Apache's own error file under mod_php) — invisible in the
+             * Render log stream.
+             */
+            'messageType' => 4,
         ],
     ];
 }

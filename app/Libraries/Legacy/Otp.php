@@ -118,24 +118,41 @@ final class Otp
     private static function send(string $to, string $code): bool
     {
         $from = (string) Config::get('otp_from_email', '');
-        if ($from === '') return false;
-        $mailer = service('email');
-        $mailer->initialize([
-            'protocol' => 'smtp',
-            'SMTPHost' => (string) Config::get('otp_smtp_host', ''),
-            'SMTPPort' => (int) Config::get('otp_smtp_port', 587),
-            'SMTPUser' => (string) Config::get('otp_smtp_user', ''),
-            'SMTPPass' => (string) Config::get('otp_smtp_pass', ''),
-            'SMTPCrypto' => (string) Config::get('otp_smtp_crypto', 'tls'),
-            'mailType' => 'text',
-            'CRLF' => "\r\n",
-            'newline' => "\r\n",
-        ]);
-        $mailer->setFrom($from, (string) Config::get('otp_from_name', 'JantaReview'));
-        $mailer->setTo($to);
-        $mailer->setSubject('Your JantaReview verification code');
-        $mailer->setMessage("Your verification code is {$code}.\n\nThis code expires in 10 minutes. If you did not request it, you can ignore this email.");
-        return $mailer->send(false);
+        $apiKey = (string) Config::get('brevo_api_key', '');
+        if ($from === '' || $apiKey === '') {
+            log_message('critical', 'OTP mail is unconfigured: OTP_FROM_EMAIL or BREVO_API_KEY is empty.');
+            return false;
+        }
+
+        $minutes = max(1, (int) round(((int) Config::get('otp_ttl_seconds', 600)) / 60));
+
+        try {
+            $response = service('curlrequest')->post((string) Config::get('brevo_api_url'), [
+                'timeout' => 15,
+                'headers' => [
+                    'api-key'      => $apiKey,
+                    'Content-Type' => 'application/json',
+                    'Accept'       => 'application/json',
+                ],
+                'json' => [
+                    'sender'  => ['name' => (string) Config::get('otp_from_name', 'JantaReview'), 'email' => $from],
+                    'to'      => [['email' => $to]],
+                    'subject' => 'Your JantaReview verification code',
+                    'textContent' => "Your verification code is {$code}.\n\n"
+                        . "This code expires in {$minutes} minutes. If you did not request it, you can ignore this email.",
+                ],
+            ]);
+        } catch (\Throwable $e) {
+            log_message('critical', 'Brevo OTP request failed: ' . $e->getMessage());
+            return false;
+        }
+
+        $status = $response->getStatusCode();
+        if ($status >= 200 && $status < 300) return true;
+
+        // Brevo's body names the rejection reason (invalid key, unverified sender, quota).
+        log_message('critical', 'Brevo rejected the OTP email: HTTP ' . $status . ' ' . (string) $response->getBody());
+        return false;
     }
 
     private static function sessionBinding(Request $req): string
