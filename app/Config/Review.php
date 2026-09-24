@@ -22,8 +22,8 @@ class Review extends BaseConfig
     public bool $exposeErrors = false;
     public string $otpFromEmail = '';
     public string $otpFromName = 'JantaReview';
-    public string $brevoApiKey = '';
-    public string $brevoApiUrl = 'https://api.brevo.com/v3/smtp/email';
+    public string $mailjetApiKey = '';
+    public string $mailjetSecretKey = '';
     public int $otpTtlSeconds = 600;
     public int $otpMaxAttempts = 5;
     public int $otpRequestPerDay = 3;
@@ -38,6 +38,7 @@ class Review extends BaseConfig
         'anonymousGrievances' => 'Anonymous_Grievances',
         'platforms' => 'Plateforms',
         'suggestions' => 'Suggestions',
+        'rateLimits' => 'Rate_Limits',
     ];
     public int $unpublishThreshold = -15;
     public int $rescueThreshold = -10;
@@ -77,10 +78,8 @@ class Review extends BaseConfig
         $this->exposeErrors = filter_var(env('REVIEW_EXPOSE_ERRORS', false), FILTER_VALIDATE_BOOLEAN);
         $this->otpFromEmail = (string) env('OTP_FROM_EMAIL', '');
         $this->otpFromName = (string) env('OTP_FROM_NAME', 'JantaReview');
-        // Render's free plan blocks outbound SMTP (25/465/587), so OTP mail goes
-        // to Brevo over HTTPS instead of straight to an SMTP relay.
-        $this->brevoApiKey = (string) env('BREVO_API_KEY', '');
-        $this->brevoApiUrl = (string) env('BREVO_API_URL', 'https://api.brevo.com/v3/smtp/email');
+        $this->mailjetApiKey = (string) env('MAILJET_API_KEY', '');
+        $this->mailjetSecretKey = (string) env('MAILJET_SECRET_KEY', '');
         $this->otpTtlSeconds = (int) env('OTP_TTL_SECONDS', 600);
         $this->otpMaxAttempts = (int) env('OTP_MAX_ATTEMPTS', 5);
         $this->otpRequestPerDay = (int) env('OTP_REQUESTS_PER_DAY', 3);

@@ -66,6 +66,16 @@ final class Turnstile
 
 final class RateLimit
 {
+    private static bool $tabChecked = false;
+
+    /**
+     * Sliding-window limiter persisted in the Rate_Limits Google Sheet tab so
+     * quotas survive Render free-plan cold starts that wipe writable/.
+     * A local flock file still serializes concurrent requests within one
+     * container; it carries no quota state, so losing it is harmless.
+     * If Sheets is unreachable the exception propagates and the API fails
+     * closed (503), so a Google outage can never become a quota bypass.
+     */
     public static function checkHourly(string $scope, string $token, int $max): bool
     {
         return self::checkWindow($scope, $token, $max, 3600);
@@ -73,27 +83,66 @@ final class RateLimit
 
     public static function checkWindow(string $scope, string $token, int $max, int $windowSeconds): bool
     {
+        return self::mutate($scope, $token, $max, $windowSeconds);
+    }
+
+    /** Count in-window hits without recording one. */
+    public static function hitCount(string $scope, string $token, int $windowSeconds): int
+    {
+        if ($token === '') return 0;
+        $key = self::digest($scope, $token);
+        $rows = Sheets::read(Sheets::sheetName('rateLimits'), 'A2:C');
+        $now = time();
+        foreach ($rows as $row) {
+            if ((string) ($row[0] ?? '') !== $key) continue;
+            $hits = self::parseHits((string) ($row[2] ?? ''));
+            return count(array_filter($hits, static fn(int $t): bool => $now - $t < $windowSeconds));
+        }
+        return 0;
+    }
+
+    /** Record a hit with no rejection cap (window-trimmed), e.g. admin failures. */
+    public static function recordHit(string $scope, string $token, int $windowSeconds): void
+    {
+        if ($token === '') return;
+        self::mutate($scope, $token, PHP_INT_MAX, $windowSeconds);
+    }
+
+    private static function mutate(string $scope, string $token, int $max, int $windowSeconds): bool
+    {
         if ($token === '' || $max < 1 || $windowSeconds < 1) return false;
-        $file = self::file($scope, $token);
-        $handle = @fopen($file, 'c+');
+        $key = self::digest($scope, $token);
+        $handle = self::lock($key);
         if ($handle === false) return false;
 
         try {
-            if (!flock($handle, LOCK_EX)) return false;
+            $sheet = Sheets::sheetName('rateLimits');
+            if (!self::$tabChecked) {
+                Sheets::ensureSheet($sheet, ['rl_key', 'scope', 'hits']);
+                self::$tabChecked = true;
+            }
+            $rows = Sheets::read($sheet, 'A2:C');
             $now = time();
-            rewind($handle);
-            $raw = stream_get_contents($handle);
-            $hits = array_values(array_filter(
-                array_map('intval', array_filter(explode("\n", (string) $raw), 'strlen')),
-                static fn(int $t): bool => $now - $t < $windowSeconds
-            ));
-            if (count($hits) >= $max) return false;
+            $rowNumber = 0;
+            $hits = [];
+            foreach ($rows as $index => $row) {
+                if ((string) ($row[0] ?? '') !== $key) continue;
+                $rowNumber = (int) $index + 2;
+                $hits = self::parseHits((string) ($row[2] ?? ''));
+                break;
+            }
 
-            $hits[] = $now;
-            ftruncate($handle, 0);
-            rewind($handle);
-            if (fwrite($handle, implode("\n", $hits)) === false) return false;
-            fflush($handle);
+            $windowHits = array_values(array_filter($hits, static fn(int $t): bool => $now - $t < $windowSeconds));
+            if (count($windowHits) >= $max) return false;
+
+            $windowHits[] = $now;
+            if (count($windowHits) > 50) $windowHits = array_slice($windowHits, -50);
+            $csv = implode(',', $windowHits);
+            if ($rowNumber > 0) {
+                Sheets::setCell($sheet, 'C' . $rowNumber, $csv, 'RAW');
+            } else {
+                Sheets::append($sheet, [$key, $scope, $csv], 'RAW');
+            }
             return true;
         } finally {
             flock($handle, LOCK_UN);
@@ -101,46 +150,85 @@ final class RateLimit
         }
     }
 
-    public static function cleanupWindow(string $scope, int $windowSeconds): int
+    /** Scope => window seconds for every limiter the app uses. */
+    public static function knownWindows(): array
     {
-        $dir = (string) Config::get('storage_path');
-        $pattern = $dir . DIRECTORY_SEPARATOR . 'rl_'
-            . preg_replace('/[^a-z0-9_]/i', '', $scope) . '_*.log';
-        $removed = 0;
-        $cutoff = time() - $windowSeconds;
-
-        foreach (glob($pattern) ?: [] as $file) {
-            $raw = @file_get_contents($file);
-            $hits = array_map('intval', array_filter(explode("\n", (string) $raw), 'strlen'));
-            $valid = array_values(array_filter($hits, static fn(int $hit): bool => $hit >= $cutoff));
-            if ($valid === []) {
-                if (@unlink($file)) $removed++;
-                continue;
-            }
-            if ($valid !== $hits) {
-                @file_put_contents($file, implode("\n", $valid), LOCK_EX);
-            }
-        }
-
-        return $removed;
+        return [
+            'otp_24h' => 86400,
+            'submit' => 3600,
+            'report' => 3600,
+            'suggestion' => 3600,
+            'admin_fail' => 3600,
+        ];
     }
 
-    private static function file(string $scope, string $token): string
+    /** Prune expired hits across all scopes in one pass; returns rows deleted. */
+    public static function cleanupAll(): int
+    {
+        $handle = self::lock('cleanup');
+        if ($handle === false) return 0;
+
+        try {
+            $sheet = Sheets::sheetName('rateLimits');
+            $rows = Sheets::read($sheet, 'A2:C');
+            $windows = self::knownWindows();
+            $now = time();
+
+            $removed = 0;
+            $survivors = [];
+            $changed = false;
+            foreach ($rows as $row) {
+                $key = (string) ($row[0] ?? '');
+                $scope = (string) ($row[1] ?? '');
+                if ($key === '') continue;
+                $window = $windows[$scope] ?? 86400;
+                $hits = self::parseHits((string) ($row[2] ?? ''));
+                $valid = array_values(array_filter($hits, static fn(int $t): bool => $now - $t < $window));
+                if ($valid === []) {
+                    $removed++;
+                    continue;
+                }
+                if (count($valid) !== count($hits)) $changed = true;
+                $survivors[] = [$key, $scope, implode(',', $valid)];
+            }
+
+            if ($removed > 0 || $changed) {
+                if ($rows !== []) {
+                    Sheets::clear($sheet, 'A2:C');
+                }
+                foreach ($survivors as $row) {
+                    Sheets::append($sheet, $row, 'RAW');
+                }
+            }
+            return $removed;
+        } finally {
+            flock($handle, LOCK_UN);
+            fclose($handle);
+        }
+    }
+
+    private static function digest(string $scope, string $token): string
+    {
+        return hash_hmac('sha256', $scope . '|' . $token, (string) Config::get('encryption_key'));
+    }
+
+    /** @return int[] */
+    private static function parseHits(string $csv): array
+    {
+        // Plausible-epoch filter also neutralizes any legacy cell that Google
+        // reformatted with thousands separators.
+        return array_values(array_filter(
+            array_map('intval', array_filter(explode(',', $csv), 'strlen')),
+            static fn(int $t): bool => $t > 1_500_000_000 && $t < 4_000_000_000
+        ));
+    }
+
+    /** @return resource|false Single mutex: cleanupAll rewrites the whole tab
+     *  by row index, so every reader/writer of Rate_Limits must serialize on it. */
+    private static function lock(string $key)
     {
         $dir = (string) Config::get('storage_path');
         if (!is_dir($dir)) @mkdir($dir, 0750, true);
-        return $dir . '/rl_' . $scope . '_' . preg_replace('/[^a-z0-9_]/i', '', $token) . '.log';
-    }
-
-    private static function read(string $file): array
-    {
-        if (!is_file($file)) return [];
-        $raw = (string) @file_get_contents($file);
-        return array_map('intval', array_filter(explode("\n", $raw), 'strlen'));
-    }
-
-    private static function write(string $file, array $hits): void
-    {
-        @file_put_contents($file, implode("\n", $hits), LOCK_EX);
+        return @fopen($dir . '/rl_global.lock', 'c');
     }
 }

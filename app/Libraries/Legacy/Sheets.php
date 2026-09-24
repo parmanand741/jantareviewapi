@@ -45,7 +45,7 @@ final class Sheets
         self::$spreadsheetId = (string) Config::get('spreadsheet_id');
     }
 
-    private static function findCaBundle(): ?string
+    public static function findCaBundle(): ?string
     {
         $candidates = [
             (string) ini_get('curl.cainfo'),
@@ -100,18 +100,19 @@ final class Sheets
     }
 
     /**
-     * Append a row.
+     * Append a row. $inputOption RAW keeps strings (e.g. comma-separated
+     * epoch lists) from being reparsed as formatted numbers by Sheets.
      */
-    public static function append(string $sheetName, array $values): void
+    public static function append(string $sheetName, array $values, string $inputOption = 'USER_ENTERED'): void
     {
         self::init();
         $body = new ValueRange(['values' => [$values]]);
-        self::withRetries(function () use ($sheetName, $body): void {
+        self::withRetries(function () use ($sheetName, $body, $inputOption): void {
                 self::$service->spreadsheets_values->append(
                     self::$spreadsheetId,
                     "'{$sheetName}'!A1",
                     $body,
-                    ['valueInputOption' => 'USER_ENTERED', 'insertDataOption' => 'INSERT_ROWS']
+                    ['valueInputOption' => $inputOption, 'insertDataOption' => 'INSERT_ROWS']
                 );
         });
     }
@@ -136,16 +137,16 @@ final class Sheets
     /**
      * Write a single cell.
      */
-    public static function setCell(string $sheetName, string $a1, mixed $value): void
+    public static function setCell(string $sheetName, string $a1, mixed $value, string $inputOption = 'USER_ENTERED'): void
     {
         self::init();
         $body = new ValueRange(['values' => [[$value]]]);
-        self::withRetries(function () use ($sheetName, $a1, $body): void {
+        self::withRetries(function () use ($sheetName, $a1, $body, $inputOption): void {
             self::$service->spreadsheets_values->update(
                 self::$spreadsheetId,
                 "'{$sheetName}'!{$a1}",
                 $body,
-                ['valueInputOption' => 'USER_ENTERED']
+                ['valueInputOption' => $inputOption]
             );
         });
     }

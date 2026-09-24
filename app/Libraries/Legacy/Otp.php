@@ -111,48 +111,57 @@ final class Otp
 
         return [
             'otpChallenges' => $removedChallenges,
-            'quotaRecords' => RateLimit::cleanupWindow('otp_24h', 86400),
+            'quotaRecords' => RateLimit::cleanupAll(),
         ];
     }
 
     private static function send(string $to, string $code): bool
     {
         $from = (string) Config::get('otp_from_email', '');
-        $apiKey = (string) Config::get('brevo_api_key', '');
-        if ($from === '' || $apiKey === '') {
-            log_message('critical', 'OTP mail is unconfigured: OTP_FROM_EMAIL or BREVO_API_KEY is empty.');
-            return false;
-        }
+        $apiKey = (string) Config::get('mailjet_api_key', '');
+        $secretKey = (string) Config::get('mailjet_secret_key', '');
+        if ($from === '' || $apiKey === '' || $secretKey === '') return false;
 
-        $minutes = max(1, (int) round(((int) Config::get('otp_ttl_seconds', 600)) / 60));
+        $payload = [
+            'Messages' => [[
+                'From' => [
+                    'Email' => $from,
+                    'Name' => (string) Config::get('otp_from_name', 'JantaReview'),
+                ],
+                'To' => [['Email' => $to]],
+                'Subject' => 'Your JantaReview verification code',
+                'TextPart' => "Your verification code is {$code}.\n\nThis code expires in 10 minutes. If you did not request it, you can ignore this email.",
+            ]],
+        ];
 
+        $curl = \Config\Services::curlrequest();
         try {
-            $response = service('curlrequest')->post((string) Config::get('brevo_api_url'), [
-                'timeout' => 15,
+            $res = $curl->post('https://api.mailjet.com/v3.1/send', [
                 'headers' => [
-                    'api-key'      => $apiKey,
                     'Content-Type' => 'application/json',
-                    'Accept'       => 'application/json',
+                    'Authorization' => 'Basic ' . base64_encode($apiKey . ':' . $secretKey),
                 ],
-                'json' => [
-                    'sender'  => ['name' => (string) Config::get('otp_from_name', 'JantaReview'), 'email' => $from],
-                    'to'      => [['email' => $to]],
-                    'subject' => 'Your JantaReview verification code',
-                    'textContent' => "Your verification code is {$code}.\n\n"
-                        . "This code expires in {$minutes} minutes. If you did not request it, you can ignore this email.",
-                ],
+                'body' => json_encode($payload),
+                'timeout' => 15,
+                'http_errors' => false,
+                // WAMP PHP ships without curl.cainfo; reuse the same CA discovery
+                // as Sheets. null on Render/Linux means the system store is used.
+                'verify' => Sheets::findCaBundle() ?? true,
             ]);
         } catch (\Throwable $e) {
-            log_message('critical', 'Brevo OTP request failed: ' . $e->getMessage());
+            log_message('error', 'Mailjet request failed: {message}', ['message' => $e->getMessage()]);
             return false;
         }
 
-        $status = $response->getStatusCode();
-        if ($status >= 200 && $status < 300) return true;
-
-        // Brevo's body names the rejection reason (invalid key, unverified sender, quota).
-        log_message('critical', 'Brevo rejected the OTP email: HTTP ' . $status . ' ' . (string) $response->getBody());
-        return false;
+        if ($res->getStatusCode() !== 200) {
+            log_message('error', 'Mailjet send failed: HTTP {code} {body}', [
+                'code' => $res->getStatusCode(),
+                'body' => (string) $res->getBody(),
+            ]);
+            return false;
+        }
+        $body = json_decode((string) $res->getBody(), true);
+        return (bool) ($body['Messages'][0]['Status'] ?? false);
     }
 
     private static function sessionBinding(Request $req): string

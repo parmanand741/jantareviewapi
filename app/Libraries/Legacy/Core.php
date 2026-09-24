@@ -25,8 +25,8 @@ final class Config
             'expose_errors' => $config->exposeErrors,
             'otp_from_email' => $config->otpFromEmail,
             'otp_from_name' => $config->otpFromName,
-            'brevo_api_key' => $config->brevoApiKey,
-            'brevo_api_url' => $config->brevoApiUrl,
+            'mailjet_api_key' => $config->mailjetApiKey,
+            'mailjet_secret_key' => $config->mailjetSecretKey,
             'otp_ttl_seconds' => $config->otpTtlSeconds,
             'otp_max_attempts' => $config->otpMaxAttempts,
             'otp_request_per_day' => $config->otpRequestPerDay,
@@ -209,35 +209,16 @@ final class Admin
 
     private static function recordFailure(): void
     {
-        $file = self::fileFor(service('request')->getIPAddress());
-        $now = time();
-        $data = array_values(array_filter(self::read($file), fn (int $t): bool => $now - $t < self::WINDOW_SECONDS));
-        $data[] = $now;
-        @file_put_contents($file, implode("\n", $data), LOCK_EX);
+        RateLimit::recordHit('admin_fail', self::ipToken(), self::WINDOW_SECONDS);
     }
 
     private static function isRateLimited(): bool
     {
-        $file = self::fileFor(service('request')->getIPAddress());
-        $now = time();
-        return count(array_filter(self::read($file), fn (int $t): bool => $now - $t < self::WINDOW_SECONDS)) >= self::MAX_FAILURES_PER_HOUR;
+        return RateLimit::hitCount('admin_fail', self::ipToken(), self::WINDOW_SECONDS) >= self::MAX_FAILURES_PER_HOUR;
     }
 
-    private static function fileFor(string $ip): string
+    private static function ipToken(): string
     {
-        $dir = (string) Config::get('storage_path');
-        if (!is_dir($dir)) {
-            @mkdir($dir, 0750, true);
-        }
-        return $dir . DIRECTORY_SEPARATOR . 'admin_fail_' . hash('sha256', $ip) . '.log';
-    }
-
-    private static function read(string $file): array
-    {
-        if (!is_file($file)) {
-            return [];
-        }
-        $raw = (string) @file_get_contents($file);
-        return array_map('intval', array_filter(explode("\n", $raw), 'strlen'));
+        return (string) service('request')->getIPAddress();
     }
 }

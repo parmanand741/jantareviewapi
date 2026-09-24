@@ -47,11 +47,9 @@ services:
       - key: REVIEW_EXPOSE_ERRORS
         value: "false"
 
-      # ---- OTP mail (non-secret parts) ----------------------------------
-      # Render's free plan blocks outbound SMTP (25/465/587), so codes are
-      # delivered through Brevo's HTTPS API; only the sender identity is set here.
+      # ---- OTP / Mailjet (non-secret parts) ------------------------------
       - key: OTP_FROM_EMAIL
-        value: noreply@jantareview.com
+        value: parmanand741@gmail.com
       - key: OTP_FROM_NAME
         value: JantaReview
       - key: OTP_TTL_SECONDS
@@ -88,5 +86,7 @@ services:
         sync: false
       - key: TURNSTILE_SECRET
         sync: false
-      - key: BREVO_API_KEY
+      - key: MAILJET_API_KEY
+        sync: false
+      - key: MAILJET_SECRET_KEY
         sync: false
