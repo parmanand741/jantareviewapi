@@ -1,0 +1,32 @@
+# Version control & local IDE
+.git
+.gitignore
+.idea
+.vscode
+
+# Secrets & environment files — NEVER bake these into the image.
+.env
+.env.*
+!.env.example
+**/service-account*.json
+**/*credentials*.json
+
+# Dependencies are installed fresh inside the image (Linux), so skip local vendor.
+vendor/
+node_modules/
+
+# Runtime writable contents (dirs are recreated by the entrypoint).
+writable/cache/*
+writable/logs/*
+writable/session/*
+writable/uploads/*
+writable/debugbar/*
+writable/review/*
+writable/secrets/*
+!writable/**/index.html
+
+# Tests, build artifacts, local tooling
+tests/
+build/
+.freebuff/
+*.log

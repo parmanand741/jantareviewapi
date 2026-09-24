@@ -1,0 +1,97 @@
+# Render Blueprint — JantaReview API (CodeIgniter 4 on PHP 8.2 + Apache)
+# Deploy: create a Blueprint from the connected GitHub repo, or create a Web
+# Service and point it at this Dockerfile. Secrets (sync:false) are entered once
+# in the Render dashboard and are NOT stored in this file/repo.
+services:
+  - type: web
+    name: jantareview-api
+    runtime: docker
+    plan: free
+    # singapore = lowest latency to Indian users. If the free plan rejects it,
+    # switch to 'oregon' in the dashboard.
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    # Lightweight 200 from Home::index (welcome view); no Google Sheets call.
+    healthCheckPath: /
+    # Single instance: file-based sessions/OTP live in writable/ and are not
+    # shared across replicas. Add a Disk (paid) mounted at /app/writable to make
+    # them durable across deploys/restarts.
+    envVars:
+      # ---- Non-secret configuration -------------------------------------
+      - key: REVIEW_SPREADSHEET_ID
+        value: 16kx-SLOOTe8tpMa8gZcZ8UeQVMIxGkxsnwQ4y9jDPgg
+      - key: REVIEW_ALLOWED_ORIGINS
+        value: https://jantareview.vercel.app
+      - key: REVIEW_TURNSTILE_HOSTS
+        value: jantareview.vercel.app
+
+      # Cross-site cookies: frontend (vercel.app) != API (onrender.com), so
+      # SameSite=None + Secure is mandatory. Do not change these.
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: COOKIE_SAMESITE
+        value: None
+
+      # MUST stay false on Render. Render terminates TLS at its edge and forwards
+      # plain HTTP to the container; App::$proxyIPs is empty, so CI4's ForceHTTPS
+      # filter would treat every request as insecure and redirect in an infinite
+      # loop. Browser<->Render is still HTTPS, so Secure cookies work fine.
+      - key: APP_FORCE_HTTPS
+        value: "false"
+
+      - key: TURNSTILE_USE_TEST_KEYS
+        value: "false"
+      - key: TURNSTILE_BYPASS_FOR_LOCAL_DEV
+        value: "false"
+      - key: REVIEW_EXPOSE_ERRORS
+        value: "false"
+
+      # ---- OTP / SMTP (non-secret parts) --------------------------------
+      - key: OTP_FROM_EMAIL
+        value: noreply@jantareview.com
+      - key: OTP_FROM_NAME
+        value: JantaReview
+      - key: OTP_SMTP_HOST
+        value: smtp.gmail.com
+      - key: OTP_SMTP_PORT
+        value: "587"
+      - key: OTP_SMTP_USER
+        value: parmanand741@gmail.com
+      - key: OTP_SMTP_CRYPTO
+        value: tls
+      - key: OTP_TTL_SECONDS
+        value: "600"
+      - key: OTP_MAX_ATTEMPTS
+        value: "3"
+      - key: OTP_REQUESTS_PER_DAY
+        value: "3"
+
+      # ---- Grievance Officer (public via ?action=compliance) ------------
+      # TODO: replace these placeholders with the real, legally-required details
+      # before going live (IT (Intermediary Guidelines) Rules, 2021).
+      - key: GRIEVANCE_OFFICER_NAME
+        value: Test Grievance Officer
+      - key: GRIEVANCE_OFFICER_EMAIL
+        value: test@example.com
+      - key: GRIEVANCE_OFFICER_PHONE
+        value: +91-0000000000
+      - key: GRIEVANCE_OFFICER_ADDRESS
+        value: Test Address
+      - key: GRIEVANCE_ACK_SLA_HOURS
+        value: "24"
+      - key: GRIEVANCE_RESOLVE_SLA_DAYS
+        value: "15"
+      - key: GRIEVANCE_PRIORITY_TAKEDOWN_HOURS
+        value: "36"
+
+      # ---- Secrets: enter in the Render dashboard (never committed) -----
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON_BASE64
+        sync: false
+      - key: REVIEW_ENCRYPTION_KEY
+        sync: false
+      - key: REVIEW_ADMIN_KEY
+        sync: false
+      - key: TURNSTILE_SECRET
+        sync: false
+      - key: OTP_SMTP_PASS
+        sync: false
