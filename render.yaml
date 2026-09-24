@@ -11,8 +11,9 @@ services:
     # switch to 'oregon' in the dashboard.
     region: singapore
     dockerfilePath: ./Dockerfile
-    # Lightweight 200 from Home::index (welcome view); no Google Sheets call.
-    healthCheckPath: /
+    # NOTE: do NOT set a health-check path. Render probes it with HEAD, and the
+    # CI4 route for '/' only accepts GET, so HEAD returns 404 and the check fails.
+    # healthCheckPath: /
     # Single instance: file-based sessions/OTP live in writable/ and are not
     # shared across replicas. Add a Disk (paid) mounted at /app/writable to make
     # them durable across deploys/restarts.

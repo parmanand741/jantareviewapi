@@ -135,17 +135,19 @@ class Logger extends BaseConfig
 
         /*
          * The ErrorlogHandler writes the logs to PHP's native `error_log()` function.
-         * Uncomment this block to use it.
+         * Enabled so exceptions also land on stderr, which Render captures in the
+         * service log stream. writable/ is ephemeral on Render, so the file log
+         * alone is lost on every redeploy.
          */
-        // 'CodeIgniter\Log\Handlers\ErrorlogHandler' => [
-        //     /* The log levels this handler can handle. */
-        //     'handles' => ['critical', 'alert', 'emergency', 'debug', 'error', 'info', 'notice', 'warning'],
-        //
-        //     /*
-        //     * The message type where the error should go. Can be 0 or 4, or use the
-        //     * class constants: `ErrorlogHandler::TYPE_OS` (0) or `ErrorlogHandler::TYPE_SAPI` (4)
-        //     */
-        //     'messageType' => 0,
-        // ],
+        'CodeIgniter\Log\Handlers\ErrorlogHandler' => [
+            /* The log levels this handler can handle. */
+            'handles' => ['critical', 'alert', 'emergency', 'error'],
+
+            /*
+            * The message type where the error should go. Can be 0 or 4, or use the
+            * class constants: `ErrorlogHandler::TYPE_OS` (0) or `ErrorlogHandler::TYPE_SAPI` (4)
+            */
+            'messageType' => 0,
+        ],
     ];
 }
