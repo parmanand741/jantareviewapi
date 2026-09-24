@@ -7,13 +7,22 @@ SECRETS_DIR="${WRITABLE}/secrets"
 
 # ---------------------------------------------------------------------------
 # 1) Google service-account JSON, delivered as a base64-encoded env var so the
-#    secret never lives in the image or the git repo.
+#    secret never lives in the image or the git repo. A bad paste must NOT crash
+#    the whole container (set -e), so decode non-fatally and only keep a
+#    non-empty result.
 # ---------------------------------------------------------------------------
 mkdir -p "${SECRETS_DIR}"
+SA_FILE="${SECRETS_DIR}/service-account.json"
 if [ -n "${GOOGLE_SERVICE_ACCOUNT_JSON_BASE64:-}" ]; then
-    printf '%s' "${GOOGLE_SERVICE_ACCOUNT_JSON_BASE64}" | base64 -d > "${SECRETS_DIR}/service-account.json"
-    chmod 600 "${SECRETS_DIR}/service-account.json"
-    echo "[entrypoint] wrote service-account.json from GOOGLE_SERVICE_ACCOUNT_JSON_BASE64"
+    # Strip whitespace/newlines Render may have added around the value, then decode.
+    if printf '%s' "${GOOGLE_SERVICE_ACCOUNT_JSON_BASE64}" | tr -d ' \t\r\n' | base64 -d > "${SA_FILE}.tmp" 2>/dev/null && [ -s "${SA_FILE}.tmp" ]; then
+        mv "${SA_FILE}.tmp" "${SA_FILE}"
+        chmod 600 "${SA_FILE}"
+        echo "[entrypoint] wrote service-account.json from GOOGLE_SERVICE_ACCOUNT_JSON_BASE64"
+    else
+        rm -f "${SA_FILE}.tmp"
+        echo "[entrypoint] WARNING: GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 is not valid base64; Google Sheets calls will fail." >&2
+    fi
 else
     echo "[entrypoint] WARNING: GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 not set; Google Sheets calls will fail." >&2
 fi
