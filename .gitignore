@@ -48,6 +48,10 @@ $RECYCLE.BIN/
 Vagrantfile
 **/service-account*.json
 **/*credentials*.json
+# Local secret dumps (e.g. base64 service-account key) must never be committed
+key.txt
+*.key
+*.pem
 
 #-------------------------
 # Temporary Files
