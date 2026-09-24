@@ -187,9 +187,17 @@ class App extends BaseConfig
      *         '192.168.5.0/24' => 'X-Real-IP',
      *     ]
      *
+     * Render terminates TLS at its edge and forwards plain HTTP to this
+     * container from loopback (its access log shows REMOTE_ADDR ::1). The
+     * real scheme/client IP therefore only exists in X-Forwarded-Proto /
+     * X-Forwarded-For, which CI4 reads solely from trusted proxies.
+     *
      * @var array<string, string>
      */
-    public array $proxyIPs = [];
+    public array $proxyIPs = [
+        '127.0.0.1' => 'X-Forwarded-For',
+        '::1'       => 'X-Forwarded-For',
+    ];
 
     /**
      * --------------------------------------------------------------------------

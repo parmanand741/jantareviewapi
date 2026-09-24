@@ -33,10 +33,10 @@ services:
       - key: COOKIE_SAMESITE
         value: None
 
-      # MUST stay false on Render. Render terminates TLS at its edge and forwards
-      # plain HTTP to the container; App::$proxyIPs is empty, so CI4's ForceHTTPS
-      # filter would treat every request as insecure and redirect in an infinite
-      # loop. Browser<->Render is still HTTPS, so Secure cookies work fine.
+      # Keep false. Render terminates TLS at its edge and forwards plain HTTP to
+      # the container; App::$proxyIPs now trusts loopback so CI4 can see the real
+      # scheme via X-Forwarded-Proto, but the ForceHTTPS filter would only add a
+      # redirect hop for traffic that already arrives over TLS from the browser.
       - key: APP_FORCE_HTTPS
         value: "false"
 
