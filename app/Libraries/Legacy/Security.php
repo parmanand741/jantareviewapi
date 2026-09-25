@@ -6,9 +6,16 @@ namespace App\Libraries\Legacy;
 
 final class Turnstile
 {
-    public static function verify(?string $token, string $expectedAction = ''): array
+    /**
+     * @param string $remoteIp The address that is submitting right now. Cloudflare
+     *                         compares it with the one that solved the challenge,
+     *                         so a token bought elsewhere and replayed here stops
+     *                         verifying. Pass '' only when it is genuinely unknown.
+     */
+    public static function verify(?string $token, string $expectedAction = '', string $remoteIp = ''): array
     {
         $host = strtolower((string)($_SERVER['HTTP_HOST'] ?? ''));
+        $testMode = (bool) Config::get('turnstile_test_mode', false);
         if ((bool) Config::get('allow_local_turnstile_bypass', false)
             && in_array(strtok($host, ':'), ['localhost', '127.0.0.1', 'reviews.local'], true)) {
             return ['ok' => true, 'reason' => 'local-debug'];
@@ -19,20 +26,21 @@ final class Turnstile
         }
 
         $secret = (string) Config::get('turnstile_secret');
+        $fields = ['secret' => $secret, 'response' => $token];
+        if ($remoteIp !== '' && filter_var($remoteIp, FILTER_VALIDATE_IP)) {
+            $fields['remoteip'] = $remoteIp;
+        }
         $ch = curl_init('https://challenges.cloudflare.com/turnstile/v0/siteverify');
         curl_setopt_array($ch, [
             CURLOPT_POST           => true,
-            CURLOPT_POSTFIELDS     => http_build_query(['secret' => $secret, 'response' => $token]),
+            CURLOPT_POSTFIELDS     => http_build_query($fields),
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT        => 10,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_IPRESOLVE      => CURL_IPRESOLVE_V4,
         ]);
-        $caBundle = (string) ini_get('curl.cainfo');
-        if ($caBundle === '') {
-            $caBundle = (string) ini_get('openssl.cafile');
-        }
-        if (is_file($caBundle)) {
+        $caBundle = Sheets::findCaBundle();
+        if ($caBundle !== null) {
             curl_setopt($ch, CURLOPT_CAINFO, $caBundle);
         }
         $body = curl_exec($ch);
@@ -48,16 +56,20 @@ final class Turnstile
             return ['ok' => false, 'reason' => $codes];
         }
 
-        $host = strtolower((string) ($r['hostname'] ?? ''));
+        // The sitekey is public, so anyone can embed it on their own page and
+        // solve it there. The hostname Cloudflare reports is the only thing
+        // that ties the token to our site, so a missing one is as suspicious
+        // as a foreign one.
+        $issuedFor = strtolower((string) ($r['hostname'] ?? ''));
         $allowed = array_map('strtolower', (array) Config::get('allowed_turnstile_hosts', []));
-        if ($host !== '' && $allowed && !in_array($host, $allowed, true)) {
-            return ['ok' => false, 'reason' => 'hostname-not-allowed:' . $host];
+        if (!$testMode && $allowed && !in_array($issuedFor, $allowed, true)) {
+            return ['ok' => false, 'reason' => 'hostname-' . ($issuedFor === '' ? 'missing' : 'not-allowed:' . $issuedFor)];
         }
 
-        $isDevelopmentTestToken = (bool) Config::get('turnstile_test_mode', false)
-            && ($r['action'] ?? '') === 'test';
-        if ($expectedAction !== '' && !empty($r['action']) && $r['action'] !== $expectedAction && !$isDevelopmentTestToken) {
-            return ['ok' => false, 'reason' => 'action-mismatch'];
+        // Every widget on the site is rendered with an explicit action, so a
+        // token that arrives without one did not come from our form.
+        if ($expectedAction !== '' && !$testMode && ($r['action'] ?? '') !== $expectedAction) {
+            return ['ok' => false, 'reason' => 'action-mismatch:' . (string) ($r['action'] ?? 'none')];
         }
 
         return ['ok' => true, 'reason' => ''];
@@ -157,6 +169,7 @@ final class RateLimit
             'otp_24h' => 86400,
             'submit' => 3600,
             'report' => 3600,
+            'urlcheck' => 3600,
             'suggestion' => 3600,
             'admin_fail' => 3600,
             'vote' => 3600,

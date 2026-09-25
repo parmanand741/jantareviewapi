@@ -11,7 +11,7 @@ final class PublicHandlers
         $data = $req->payload['data'] ?? [];
         $token = (string)($req->payload['turnstileToken'] ?? '');
 
-        $ts = Turnstile::verify($token, 'submit');
+        $ts = Turnstile::verify($token, 'submit', $req->ip);
         if (!$ts['ok']) Response::error('Bot protection failed (' . $ts['reason'] . ').');
 
         if (!RateLimit::checkHourly('submit', $req->submitterToken, (int) Config::get('submit_per_hour'))) {
@@ -85,6 +85,12 @@ final class PublicHandlers
         $reviewText = Validator::sanitize($data['reviewText'] ?? '', (int) Config::get('review_plain_max_len'));
         if (mb_strlen($reviewText) < 10) Response::error('Review must be at least 10 characters.');
 
+        $linkStatus = 'inherited';
+        if (!$isReply) {
+            $linkToken = (string) ($req->payload['linkToken'] ?? $data['linkToken'] ?? '');
+            $linkStatus = self::enforceLink($productUrl, $linkToken);
+        }
+
         $encrypted = Crypto::encrypt($reviewText);
         if (strlen($encrypted) > (int) Config::get('review_enc_max_len')) {
             Response::error('Review is too large to store. Please shorten it.');
@@ -134,7 +140,7 @@ final class PublicHandlers
             'reviewText'  => mb_substr($reviewText, 0, 240),
             'actionType'  => $isReply ? 'reply_published' : 'published',
             'actor'       => 'community',
-            'reason'      => 'Initial submission',
+            'reason'      => $isReply ? 'Initial submission' : 'Initial submission · product link ' . $linkStatus,
             'relatedId'   => $parentId,
             'contentHash' => $hash,
         ]);
@@ -144,6 +150,66 @@ final class PublicHandlers
             'reviewId' => $uniqueId,
             'isReply'  => $isReply,
         ]);
+    }
+
+    /**
+     * Reject a link only when it is provably useless. A link we could not
+     * confirm (bot wall, timeout) is accepted and recorded as such, because
+     * the store blocking our server says nothing about the reviewer.
+     */
+    private static function enforceLink(string $productUrl, string $token): string
+    {
+        $trusted = ProductLink::consume($productUrl, $token);
+        if ($trusted !== null) {
+            return $trusted['verdict'] === ProductLink::VALID ? 'verified' : 'unverified:' . $trusted['code'];
+        }
+
+        // No fresh check for this exact link — look at it ourselves before deciding.
+        $result = ProductLink::inspect($productUrl);
+        if ($result['verdict'] === ProductLink::INVALID) {
+            Response::error($result['message']);
+        }
+        return $result['verdict'] === ProductLink::VALID ? 'verified' : 'unverified:' . $result['code'];
+    }
+
+    public static function checkProductUrl(Request $req): never
+    {
+        $perHour = max(1, (int) Config::get('link_check_per_hour', 25));
+        if (!RateLimit::checkWindow('urlcheck', $req->submitterToken, $perHour, 3600)) {
+            Response::error('Too many link checks in the last hour. Please submit your review with the link you already have.', 429);
+        }
+
+        $url = Validator::url($req->payload['productUrl'] ?? '');
+        if ($url === '') {
+            Response::ok([
+                'verdict'       => ProductLink::INVALID,
+                'code'          => 'bad_url',
+                'message'       => 'That is not a usable product link. Paste the full address of the product page, starting with https://',
+                'title'         => '',
+                'image'         => '',
+                'siteName'      => '',
+                'finalUrl'      => '',
+                'normalizedUrl' => '',
+                'host'          => '',
+            ]);
+        }
+
+        $result = ProductLink::inspect($url);
+        $payload = [
+            'verdict'       => $result['verdict'],
+            'code'          => $result['code'],
+            'message'       => $result['message'],
+            'title'         => $result['title'],
+            'image'         => $result['image'],
+            'siteName'      => $result['siteName'],
+            'finalUrl'      => $result['finalUrl'],
+            'normalizedUrl' => $url,
+            'host'          => (string) (parse_url($url, PHP_URL_HOST) ?: ''),
+        ];
+        if ($result['verdict'] !== ProductLink::INVALID) {
+            $payload['linkToken'] = ProductLink::issue($url, $result['verdict'], $result['code']);
+        }
+        Response::ok($payload);
     }
 
     public static function getReviews(): never
@@ -220,7 +286,7 @@ final class PublicHandlers
 
         // A Turnstile challenge is now mandatory for BOTH vote directions;
         // previously "helpful" was completely unguarded.
-        $ts = Turnstile::verify($token, 'vote_' . $voteType);
+        $ts = Turnstile::verify($token, 'vote_' . $voteType, $req->ip);
         if (!$ts['ok']) Response::error('Verification failed (' . $ts['reason'] . ').');
 
         if (!RateLimit::checkHourly('vote', $req->submitterToken, (int) Config::get('vote_per_hour', 10))) {
@@ -403,7 +469,7 @@ final class PublicHandlers
             Response::error('This entry was reported recently. Please wait a while before reporting it again.');
         }
 
-        $ts = Turnstile::verify($token, 'report');
+        $ts = Turnstile::verify($token, 'report', $req->ip);
         if (!$ts['ok']) Response::error('Verification failed (' . $ts['reason'] . ').');
 
         $rc = (int)($row[10] ?? 0) + 1;
@@ -453,7 +519,7 @@ final class PublicHandlers
         $data = $req->payload['data'] ?? [];
         $token = (string)($req->payload['turnstileToken'] ?? '');
 
-        $ts = Turnstile::verify($token, 'grievance');
+        $ts = Turnstile::verify($token, 'grievance', $req->ip);
         if (!$ts['ok']) Response::error('Verification failed (' . $ts['reason'] . ').');
 
         $reviewId = Validator::sanitize($data['reviewId'] ?? '', 20);

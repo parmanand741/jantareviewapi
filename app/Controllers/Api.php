@@ -95,6 +95,7 @@ final class Api extends BaseController
             'adminLogout' => $this->adminLogout(),
             'adminSession' => $this->adminSession(),
             'submitReview' => PublicHandlers::submitReview($request),
+            'checkProductUrl' => PublicHandlers::checkProductUrl($request),
             'requestReviewOtp' => Otp::request($request, (string) (($request->payload['data']['email'] ?? ''))),
             'verifyReviewOtp' => Otp::verify(
                 $request,
