@@ -19,6 +19,13 @@ services:
     # them durable across deploys/restarts.
     envVars:
       # ---- Non-secret configuration -------------------------------------
+      # production keeps stack traces and .env dumps out of HTTP responses.
+      # With CI_ENVIRONMENT=development the API leaks its own source on any
+      # uncaught error, which is why this is pinned here rather than left to
+      # the dashboard value.
+      - key: CI_ENVIRONMENT
+        value: production
+
       - key: REVIEW_SPREADSHEET_ID
         value: 16kx-SLOOTe8tpMa8gZcZ8UeQVMIxGkxsnwQ4y9jDPgg
       - key: REVIEW_ALLOWED_ORIGINS
@@ -47,9 +54,55 @@ services:
       - key: REVIEW_EXPOSE_ERRORS
         value: "false"
 
+      # ---- Abuse-prevention tuning (all optional; these are the defaults) --
+      # Changing REVIEW_IDENTITY_PEPPER re-keys every stored submitter token,
+      # so past votes/reports stop matching the devices that filed them. Set it
+      # once, before launch, and leave it alone. Empty means "derive from
+      # REVIEW_ENCRYPTION_KEY".
+      - key: REVIEW_VOTE_USER_COOLDOWN_SECONDS
+        value: "300"
+      - key: REVIEW_REPORT_TIER_FREE
+        value: "5"
+      - key: REVIEW_REPORT_TIER_SLOW
+        value: "1"
+      - key: REVIEW_REPORT_TIER_SLOW_SECONDS
+        value: "18000"
+      - key: REVIEW_RESCUE_HYSTERESIS_STEP
+        value: "2"
+      - key: REVIEW_READ_PER_MINUTE
+        value: "120"
+      - key: REVIEW_OTP_PER_IP_PER_DAY
+        value: "20"
+      - key: REVIEW_TICKET_MIN_AGE_SECONDS
+        value: "3"
+      - key: REVIEW_QUARANTINE_SECONDS
+        value: "1800"
+      - key: REVIEW_DEDUPE_WINDOW_SECONDS
+        value: "86400"
+      # Site-wide ceilings per hour, as scope=N pairs. 0 disables one.
+      - key: REVIEW_GLOBAL_CAPS
+        value: "submit=300,vote=3000,report=600,urlcheck=600,suggestion=300,grievance=200,otp=400"
+      - key: REVIEW_GRIEVANCE_PER_HOUR
+        value: "3"
+      # Rows purged from the audit log; content archive purges at
+      # REVIEW_RETENTION_DAYS.
+      - key: REVIEW_AUDIT_RETENTION_DAYS
+        value: "180"
+      # Comma-separated client IPs allowed to reach the admin panel. Empty
+      # means no IP restriction (only the key, the idle TTL and the step-up
+      # key apply).
+      - key: REVIEW_ADMIN_ALLOWED_IPS
+        value: ""
+      - key: REVIEW_ADMIN_TTL_SECONDS
+        value: "1800"
+      # Sends the grievance acknowledgement mail. Off until the officer
+      # identity below stops being a placeholder.
+      - key: GRIEVANCE_NOTIFY_ENABLED
+        value: "false"
+
       # ---- OTP / Mailjet (non-secret parts) ------------------------------
       - key: OTP_FROM_EMAIL
-        value: parmanand741@gmail.com
+        value: noreply.jantareview@gmail.com
       - key: OTP_FROM_NAME
         value: JantaReview
       - key: OTP_TTL_SECONDS
@@ -81,6 +134,8 @@ services:
       - key: GOOGLE_SERVICE_ACCOUNT_JSON_BASE64
         sync: false
       - key: REVIEW_ENCRYPTION_KEY
+        sync: false
+      - key: REVIEW_IDENTITY_PEPPER
         sync: false
       - key: REVIEW_ADMIN_KEY
         sync: false

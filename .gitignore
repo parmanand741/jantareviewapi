@@ -71,6 +71,10 @@ key.txt
 /writable/debugbar/*
 !/writable/debugbar/index.html
 
+# OTP challenges, per-review locks and datastore exports. All of it is either
+# secret or a copy of everything the site holds.
+/writable/review/*
+
 php_errors.log
 
 #-------------------------

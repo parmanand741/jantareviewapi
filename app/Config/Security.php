@@ -80,7 +80,11 @@ class Security extends BaseConfig
      *
      * Redirect to previous page with error on failure.
      *
+     * Kept false on purpose: /api is a JSON endpoint called with fetch(), which
+     * would follow a 302 and hand the caller HTML where it expects an error
+     * object. Throwing instead produces a clean 403 the frontend can surface.
+     *
      * @see https://codeigniter4.github.io/userguide/libraries/security.html#redirection-on-failure
      */
-    public bool $redirect = (ENVIRONMENT === 'production');
+    public bool $redirect = false;
 }

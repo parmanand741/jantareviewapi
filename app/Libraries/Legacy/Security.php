@@ -98,6 +98,67 @@ final class RateLimit
         return self::mutate($scope, $token, $max, $windowSeconds);
     }
 
+    /**
+     * Sliding cap plus a minimum spacing requirement resolved from a single
+     * Sheet read. Returns 'ok', 'gap' (the previous hit is younger than
+     * $gapSeconds) or 'cap'. Only 'ok' records a hit.
+     */
+    public static function checkSpaced(
+        string $scope,
+        string $token,
+        int $max,
+        int $windowSeconds,
+        int $gapSeconds
+    ): string {
+        return self::mutateDetailed($scope, $token, $max, $windowSeconds, $gapSeconds);
+    }
+
+    /**
+     * Site-wide ceiling and per-IP read throttle. Deliberately local to the
+     * container: these are backstops against a flood, and putting them in
+     * Sheets would double the API traffic every gated request can carry.
+     * A cold start resets them, which only ever lets one extra burst through.
+     */
+    public static function checkLocal(string $bucket, int $max, int $windowSeconds): bool
+    {
+        if ($max < 1 || $windowSeconds < 1) return true;
+
+        $dir = (string) Config::get('storage_path');
+        if (!is_dir($dir)) @mkdir($dir, 0750, true);
+        $path = $dir . '/rlc_' . hash('sha256', $bucket) . '.json';
+
+        // 'c+' not 'c': the latter opens write-only, and reading the hit list
+        // back from it fails with a bad-file-descriptor notice.
+        $handle = @fopen($path, 'c+');
+        if ($handle === false) return true;
+        if (!flock($handle, LOCK_EX)) {
+            fclose($handle);
+            return true;
+        }
+
+        try {
+            $raw = stream_get_contents($handle, 2048);
+            $stored = $raw === false ? [] : (json_decode($raw, true) ?: []);
+            $now = time();
+            $hits = array_values(array_filter(
+                array_map('intval', is_array($stored) ? $stored : []),
+                static fn(int $t): bool => $t > $now - $windowSeconds
+            ));
+            if (count($hits) >= $max) return false;
+
+            $hits[] = $now;
+            if (count($hits) > 2000) $hits = array_slice($hits, -2000);
+            rewind($handle);
+            ftruncate($handle, 0);
+            fwrite($handle, json_encode($hits));
+            fflush($handle);
+            return true;
+        } finally {
+            flock($handle, LOCK_UN);
+            fclose($handle);
+        }
+    }
+
     /** Count in-window hits without recording one. */
     public static function hitCount(string $scope, string $token, int $windowSeconds): int
     {
@@ -122,10 +183,20 @@ final class RateLimit
 
     private static function mutate(string $scope, string $token, int $max, int $windowSeconds): bool
     {
-        if ($token === '' || $max < 1 || $windowSeconds < 1) return false;
+        return self::mutateDetailed($scope, $token, $max, $windowSeconds, 0) === 'ok';
+    }
+
+    private static function mutateDetailed(
+        string $scope,
+        string $token,
+        int $max,
+        int $windowSeconds,
+        int $gapSeconds
+    ): string {
+        if ($token === '' || $max < 1 || $windowSeconds < 1) return 'cap';
         $key = self::digest($scope, $token);
         $handle = self::lock($key);
-        if ($handle === false) return false;
+        if ($handle === false) return 'cap';
 
         try {
             $sheet = Sheets::sheetName('rateLimits');
@@ -145,7 +216,12 @@ final class RateLimit
             }
 
             $windowHits = array_values(array_filter($hits, static fn(int $t): bool => $now - $t < $windowSeconds));
-            if (count($windowHits) >= $max) return false;
+            if ($gapSeconds > 0) {
+                foreach ($windowHits as $last) {
+                    if ($now - $last < $gapSeconds) return 'gap';
+                }
+            }
+            if (count($windowHits) >= $max) return 'cap';
 
             $windowHits[] = $now;
             if (count($windowHits) > 50) $windowHits = array_slice($windowHits, -50);
@@ -155,7 +231,7 @@ final class RateLimit
             } else {
                 Sheets::append($sheet, [$key, $scope, $csv], 'RAW');
             }
-            return true;
+            return 'ok';
         } finally {
             flock($handle, LOCK_UN);
             fclose($handle);
@@ -167,8 +243,11 @@ final class RateLimit
     {
         return [
             'otp_24h' => 86400,
+            'otp_day_ip' => 86400,
+            // 86400 not 3600: the report tier check reads a day of hits from
+            // this row, and pruning to the hourly window would reset it.
             'submit' => 3600,
-            'report' => 3600,
+            'report' => 86400,
             'urlcheck' => 3600,
             'suggestion' => 3600,
             'admin_fail' => 3600,
@@ -188,10 +267,9 @@ final class RateLimit
             $windows = self::knownWindows();
             $now = time();
 
-            $removed = 0;
-            $survivors = [];
-            $changed = false;
-            foreach ($rows as $row) {
+            $doomed = [];
+            $updates = [];
+            foreach ($rows as $i => $row) {
                 $key = (string) ($row[0] ?? '');
                 $scope = (string) ($row[1] ?? '');
                 if ($key === '') continue;
@@ -199,22 +277,25 @@ final class RateLimit
                 $hits = self::parseHits((string) ($row[2] ?? ''));
                 $valid = array_values(array_filter($hits, static fn(int $t): bool => $now - $t < $window));
                 if ($valid === []) {
-                    $removed++;
+                    $doomed[] = $i + 2;
                     continue;
                 }
-                if (count($valid) !== count($hits)) $changed = true;
-                $survivors[] = [$key, $scope, implode(',', $valid)];
+                if (count($valid) !== count($hits)) {
+                    $updates[] = ['range' => 'C' . ($i + 2), 'values' => [[implode(',', $valid)]]];
+                }
             }
 
-            if ($removed > 0 || $changed) {
-                if ($rows !== []) {
-                    Sheets::clear($sheet, 'A2:C');
-                }
-                foreach ($survivors as $row) {
-                    Sheets::append($sheet, $row, 'RAW');
-                }
+            // Trimming hit lists before the deletions keeps every row number
+            // gathered above valid. Rewriting the whole tab instead would also
+            // drop anything appended by a live request mid-pass.
+            if ($updates !== []) {
+                Sheets::batchWrite($sheet, $updates);
             }
-            return $removed;
+            if ($doomed !== []) {
+                Sheets::deleteRows($sheet, $doomed);
+            }
+
+            return count($doomed);
         } finally {
             flock($handle, LOCK_UN);
             fclose($handle);

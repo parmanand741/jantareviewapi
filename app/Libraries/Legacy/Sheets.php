@@ -9,6 +9,8 @@ use Google\Service\Sheets as GoogleSheets;
 use Google\Service\Sheets\ValueRange;
 use Google\Service\Sheets\BatchUpdateValuesRequest;
 use Google\Service\Sheets\BatchUpdateSpreadsheetRequest;
+use Google\Service\Sheets\DeleteDimensionRequest;
+use Google\Service\Sheets\DimensionRange;
 use Google\Service\Sheets\Request as SheetsRequest;
 use GuzzleHttp\Client as GuzzleClient;
 use GuzzleHttp\Exception\TransferException;
@@ -69,13 +71,13 @@ final class Sheets
     }
 
     /**
-     * Read a rectangular range.
+     * Read a rectangular range. An empty range asks for the whole tab.
      * @return array<int, array<int, mixed>>
      */
     public static function read(string $sheetName, string $range): array
     {
         self::init();
-        $full = "'{$sheetName}'!{$range}";
+        $full = $range === '' ? "'{$sheetName}'" : "'{$sheetName}'!{$range}";
         for ($attempt = 1; $attempt <= 6; $attempt++) {
             try {
                 $resp = self::$service->spreadsheets_values->get(self::$spreadsheetId, $full);
@@ -100,21 +102,38 @@ final class Sheets
     }
 
     /**
-     * Append a row. $inputOption RAW keeps strings (e.g. comma-separated
-     * epoch lists) from being reparsed as formatted numbers by Sheets.
+     * Append a row. RAW is the default: USER_ENTERED makes Sheets reparse
+     * strings that look like dates, numbers or comma-separated lists, which
+     * silently corrupts timestamps and epoch hit lists.
      */
-    public static function append(string $sheetName, array $values, string $inputOption = 'USER_ENTERED'): void
+    /**
+     * Append one row and return its row number, or null when the API did not
+     * tell us. Callers that have to stamp a field on the row they just created
+     * would otherwise need a second read to find it.
+     */
+    public static function append(string $sheetName, array $values, string $inputOption = 'RAW'): ?int
     {
         self::init();
         $body = new ValueRange(['values' => [$values]]);
-        self::withRetries(function () use ($sheetName, $body, $inputOption): void {
-                self::$service->spreadsheets_values->append(
-                    self::$spreadsheetId,
-                    "'{$sheetName}'!A1",
-                    $body,
-                    ['valueInputOption' => $inputOption, 'insertDataOption' => 'INSERT_ROWS']
-                );
+        $updatedRange = null;
+        self::withRetries(function () use ($sheetName, $body, $inputOption, &$updatedRange): void {
+            $response = self::$service->spreadsheets_values->append(
+                self::$spreadsheetId,
+                "'{$sheetName}'!A1",
+                $body,
+                ['valueInputOption' => $inputOption, 'insertDataOption' => 'INSERT_ROWS']
+            );
+            try {
+                $updatedRange = $response->getUpdates()?->getUpdatedRange();
+            } catch (\Throwable $e) {
+                $updatedRange = null;
+            }
         });
+
+        if (is_string($updatedRange) && preg_match('/![A-Z]+(\d+):/', $updatedRange, $m) === 1) {
+            return (int) $m[1];
+        }
+        return null;
     }
 
     /**
@@ -129,7 +148,7 @@ final class Sheets
                 self::$spreadsheetId,
                 "'{$sheetName}'!{$range}",
                 $body,
-                ['valueInputOption' => 'USER_ENTERED']
+                ['valueInputOption' => 'RAW']
             );
         });
     }
@@ -137,7 +156,7 @@ final class Sheets
     /**
      * Write a single cell.
      */
-    public static function setCell(string $sheetName, string $a1, mixed $value, string $inputOption = 'USER_ENTERED'): void
+    public static function setCell(string $sheetName, string $a1, mixed $value, string $inputOption = 'RAW'): void
     {
         self::init();
         $body = new ValueRange(['values' => [[$value]]]);
@@ -171,7 +190,7 @@ final class Sheets
             $updates
         );
         $body = new BatchUpdateValuesRequest([
-            'valueInputOption' => 'USER_ENTERED',
+            'valueInputOption' => 'RAW',
             'data' => $data,
         ]);
 
@@ -196,6 +215,132 @@ final class Sheets
                 new \Google\Service\Sheets\ClearValuesRequest()
             );
         });
+    }
+
+    /**
+     * Delete whole rows in one batchUpdate.
+     *
+     * A clear-then-write of the survivors loses the entire tab if the second
+     * call fails and reparses every stored value on the way back in, so rows
+     * are removed where they stand. Contiguous numbers are merged and applied
+     * high-to-low because requests in one batchUpdate see the deletions that
+     * already ran.
+     *
+     * @param array<int, int> $rowNumbers one-based sheet row numbers
+     */
+    public static function deleteRows(string $sheetName, array $rowNumbers): int
+    {
+        $rows = array_values(array_unique(array_filter(array_map('intval', $rowNumbers), static fn(int $r): bool => $r > 1)));
+        if ($rows === []) {
+            return 0;
+        }
+
+        self::init();
+        sort($rows);
+
+        $spans = [];
+        $start = $end = $rows[0];
+        $count = count($rows);
+        for ($i = 1; $i < $count; $i++) {
+            if ($rows[$i] === $end + 1) {
+                $end = $rows[$i];
+                continue;
+            }
+            $spans[] = [$start, $end];
+            $start = $end = $rows[$i];
+        }
+        $spans[] = [$start, $end];
+
+        $sheetId = self::sheetId($sheetName);
+        $requests = [];
+        foreach (array_reverse($spans) as [$from, $to]) {
+            $requests[] = new SheetsRequest([
+                'deleteDimension' => new DeleteDimensionRequest([
+                    'range' => new DimensionRange([
+                        'sheetId' => $sheetId,
+                        'dimension' => 'ROWS',
+                        // one-based inclusive rows become zero-based half-open indexes
+                        'startIndex' => $from - 1,
+                        'endIndex' => $to,
+                    ]),
+                ]),
+            ]);
+        }
+
+        $body = new BatchUpdateSpreadsheetRequest(['requests' => $requests]);
+        // Deliberately one attempt. These requests carry absolute row numbers,
+        // so a retry after a lost response would delete whatever now sits at
+        // those indices — the rows below have shifted up. A failed purge is
+        // loud and repeats next night; a mis-aimed one is silent data loss.
+        self::$service->spreadsheets->batchUpdate(self::$spreadsheetId, $body);
+
+        return count($rows);
+    }
+
+    /**
+     * Create an empty tab. Used by the restore rehearsal, which writes a
+     * backup into a quarantine tab rather than over live rows.
+     */
+    public static function addSheet(string $sheetName): void
+    {
+        self::init();
+        if (array_key_exists($sheetName, self::tabIds())) {
+            throw new RuntimeException("Sheet '{$sheetName}' already exists.");
+        }
+
+        $req = new SheetsRequest([
+            'addSheet' => ['properties' => ['title' => $sheetName]],
+        ]);
+        self::withRetries(function () use ($req): void {
+            self::$service->spreadsheets->batchUpdate(
+                self::$spreadsheetId,
+                new BatchUpdateSpreadsheetRequest(['requests' => [$req]])
+            );
+        });
+    }
+
+    /** One-based column index as it appears in an A1 range. */
+    public static function columnLetter(int $index): string
+    {
+        $letter = '';
+        while ($index > 0) {
+            $mod = ($index - 1) % 26;
+            $letter = chr(65 + $mod) . $letter;
+            $index = intdiv($index - $mod, 26);
+        }
+
+        return $letter === '' ? 'A' : $letter;
+    }
+
+    private static function sheetId(string $sheetName): int
+    {
+        foreach (self::tabIds() as $title => $id) {
+            if ($title === $sheetName) {
+                return $id;
+            }
+        }
+
+        throw new RuntimeException("Sheet '{$sheetName}' does not exist.");
+    }
+
+    /** @return array<string, int> tab title => numeric sheet id, in sheet order */
+    public static function tabIds(): array
+    {
+        self::init();
+        $spreadsheet = null;
+        self::withRetries(function () use (&$spreadsheet): void {
+            $spreadsheet = self::$service->spreadsheets->get(
+                self::$spreadsheetId,
+                ['fields' => 'sheets.properties.title,sheets.properties.sheetId']
+            );
+        });
+
+        $ids = [];
+        foreach ($spreadsheet->getSheets() as $sheet) {
+            $ids[(string) $sheet->getProperties()->getTitle()] = (int) $sheet->getProperties()->getSheetId();
+        }
+
+        return $ids;
     }
 
     private static function withRetries(callable $operation): void

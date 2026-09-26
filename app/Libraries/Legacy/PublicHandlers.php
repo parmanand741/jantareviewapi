@@ -11,6 +11,13 @@ final class PublicHandlers
         $data = $req->payload['data'] ?? [];
         $token = (string)($req->payload['turnstileToken'] ?? '');
 
+        // Cheapest guard first: this ceiling is file-backed, so a flood gets
+        // rejected without spending a Turnstile verification or any Sheets
+        // quota on requests we already know we will refuse.
+        if (!RateLimit::checkLocal('global:submit', (int) (Config::get('global_caps', [])['submit'] ?? 0), 3600)) {
+            Response::error('The site is busy right now. Please try again in a few minutes.', 503);
+        }
+
         $ts = Turnstile::verify($token, 'submit', $req->ip);
         if (!$ts['ok']) Response::error('Bot protection failed (' . $ts['reason'] . ').');
 
@@ -24,12 +31,17 @@ final class PublicHandlers
         $reviewSheet = Sheets::sheetName('reviews');
         $idempotencyKey = Validator::sanitize($data['idempotencyKey'] ?? '', 64);
         if ($idempotencyKey === '') Response::error('Missing submission token.');
-        $reviewRows = Sheets::read($reviewSheet, 'A1:R');
+        $reviewRows = Sheets::read($reviewSheet, 'A1:U');
         $header = $reviewRows[0] ?? [];
-        if (($header[16] ?? '') !== 'idempotencyKey' || ($header[17] ?? '') !== 'platform') {
+        if (($header[16] ?? '') !== 'idempotencyKey' || ($header[17] ?? '') !== 'platform'
+            || ($header[18] ?? '') !== 'archiveCycles' || ($header[19] ?? '') !== 'textHash'
+            || ($header[20] ?? '') !== 'flags') {
             Sheets::batchWrite($reviewSheet, [
                 ['range' => 'Q1', 'values' => [['idempotencyKey']]],
                 ['range' => 'R1', 'values' => [['platform']]],
+                ['range' => 'S1', 'values' => [['archiveCycles']]],
+                ['range' => 'T1', 'values' => [['textHash']]],
+                ['range' => 'U1', 'values' => [['flags']]],
             ]);
         }
         $all = array_slice($reviewRows, 1);
@@ -85,10 +97,25 @@ final class PublicHandlers
         $reviewText = Validator::sanitize($data['reviewText'] ?? '', (int) Config::get('review_plain_max_len'));
         if (mb_strlen($reviewText) < 10) Response::error('Review must be at least 10 characters.');
 
+        // Checked before the link probe and before the OTP is spent, so a
+        // rejection costs the reviewer nothing.
+        $textHash = Signals::textHash($reviewText);
+        $copy = Signals::duplicateOf($all, $textHash, $req->submitterToken);
+        if ($copy !== []) {
+            Response::error('That review text has already been published here. Please write about your own experience.');
+        }
+        $flags = Signals::flags($reviewText, $productUrl, $productName);
+
         $linkStatus = 'inherited';
         if (!$isReply) {
             $linkToken = (string) ($req->payload['linkToken'] ?? $data['linkToken'] ?? '');
             $linkStatus = self::enforceLink($productUrl, $linkToken);
+            $siblings = Signals::linkSiblings($all, $productUrl);
+            if ($siblings >= 5) {
+                // Recorded, never enforced: five people genuinely can own one
+                // phone. It is the pattern an admin should be able to spot.
+                $flags[] = 'link_reused_' . min($siblings, 5) . 'plus';
+            }
         }
 
         $encrypted = Crypto::encrypt($reviewText);
@@ -109,7 +136,7 @@ final class PublicHandlers
         $now = Time::nowIso();
         $hash = Crypto::contentHash($uniqueId, $now, $reviewText);
 
-        // Build the row (columns A..P).
+        // Build the row (columns A..U).
         $row = [
             $uniqueId,
             $now,
@@ -129,6 +156,9 @@ final class PublicHandlers
             $req->submitterToken, // P: submitterToken
             $idempotencyKey,   // Q: idempotency key
             $platform,         // R: platform
+            0,                 // S: archive cycles
+            $textHash,         // T: keyed hash of the normalized text
+            implode(',', $flags), // U: advisory spam flags
         ];
         Sheets::append($reviewSheet, $row);
 
@@ -137,10 +167,10 @@ final class PublicHandlers
             'productName' => $productName,
             'productUrl'  => $productUrl,
             'stars'       => $stars,
-            'reviewText'  => mb_substr($reviewText, 0, 240),
             'actionType'  => $isReply ? 'reply_published' : 'published',
             'actor'       => 'community',
-            'reason'      => $isReply ? 'Initial submission' : 'Initial submission · product link ' . $linkStatus,
+            'reason'      => ($isReply ? 'Initial submission' : 'Initial submission · product link ' . $linkStatus)
+                . ($flags === [] ? '' : ' · flagged: ' . implode(', ', $flags)),
             'relatedId'   => $parentId,
             'contentHash' => $hash,
         ]);
@@ -161,7 +191,7 @@ final class PublicHandlers
     {
         $trusted = ProductLink::consume($productUrl, $token);
         if ($trusted !== null) {
-            return $trusted['verdict'] === ProductLink::VALID ? 'verified' : 'unverified:' . $trusted['code'];
+            return self::linkStatus($trusted['verdict'], $trusted['code']);
         }
 
         // No fresh check for this exact link — look at it ourselves before deciding.
@@ -169,12 +199,30 @@ final class PublicHandlers
         if ($result['verdict'] === ProductLink::INVALID) {
             Response::error($result['message']);
         }
-        return $result['verdict'] === ProductLink::VALID ? 'verified' : 'unverified:' . $result['code'];
+        return self::linkStatus($result['verdict'], $result['code']);
+    }
+
+    /**
+     * What the audit trail says about a link, in the strongest terms we earned:
+     * 'verified' only when we read the product page itself.
+     */
+    private static function linkStatus(string $verdict, string $code): string
+    {
+        if ($verdict === ProductLink::VALID) {
+            return $code === 'product_confirmed' ? 'verified' : 'unconfirmed';
+        }
+        return 'unverified:' . $code;
     }
 
     public static function checkProductUrl(Request $req): never
     {
+        // No Turnstile here on purpose: the response is stateless, writes
+        // nothing, and the fetch itself is pinned to public https addresses by
+        // ProductLink. The budget is what protects the outbound socket.
         $perHour = max(1, (int) Config::get('link_check_per_hour', 25));
+        if (!RateLimit::checkLocal('global:urlcheck', (int) (Config::get('global_caps', [])['urlcheck'] ?? 0), 3600)) {
+            Response::error('The site is busy right now. Please try again in a few minutes.', 503);
+        }
         if (!RateLimit::checkWindow('urlcheck', $req->submitterToken, $perHour, 3600)) {
             Response::error('Too many link checks in the last hour. Please submit your review with the link you already have.', 429);
         }
@@ -242,7 +290,6 @@ final class PublicHandlers
                 'store'       => self::detectStore($host),
                 'parentId'    => (string)($r[13] ?? ''),
                 'isReply'     => $isReply,
-                'contentHash' => (string)($r[14] ?? ''),
                 'platform'    => (string)($r[17] ?? ''),
             ];
 
@@ -284,21 +331,39 @@ final class PublicHandlers
             Response::error('Missing parameters.');
         }
 
+        // The site-wide ceiling is file-backed and free, so it runs before the
+        // captcha call and before checkSpaced records anything: a flood gets
+        // refused without pushing every visitor's own vote window out.
+        if (!RateLimit::checkLocal('global:vote', (int) (Config::get('global_caps', [])['vote'] ?? 0), 3600)) {
+            Response::error('The site is busy right now. Please try again in a few minutes.', 503);
+        }
+
         // A Turnstile challenge is now mandatory for BOTH vote directions;
         // previously "helpful" was completely unguarded.
         $ts = Turnstile::verify($token, 'vote_' . $voteType, $req->ip);
         if (!$ts['ok']) Response::error('Verification failed (' . $ts['reason'] . ').');
 
-        if (!RateLimit::checkHourly('vote', $req->submitterToken, (int) Config::get('vote_per_hour', 10))) {
+        // One vote per entry, keyed on the visitor alone. session_id() used to
+        // be part of this, which let anyone clear cookies to vote again.
+        $voterKey = self::voterKey($reviewId, $req->submitterToken);
+
+        // Caps: 1 vote per entry, spacing across every entry, and an hourly
+        // ceiling per visitor. 'gap' is checked before 'cap' is recorded, so a
+        // throttled attempt does not push the visitor's own window out.
+        $gap = (int) Config::get('vote_user_cooldown_seconds', 300);
+        $result = RateLimit::checkSpaced(
+            'vote',
+            $req->submitterToken,
+            (int) Config::get('vote_per_hour', 10),
+            3600,
+            $gap
+        );
+        if ($result === 'gap') {
+            Response::error('You voted recently. Please wait a few minutes before voting again.', 429);
+        }
+        if ($result !== 'ok') {
             Response::error('Too many votes from this device recently. Please try again later.', 429);
         }
-
-        service('session');
-        $voterKey = hash_hmac(
-            'sha256',
-            'vote|' . $reviewId . '|' . session_id() . '|' . $req->submitterToken,
-            (string) Config::get('encryption_key')
-        );
 
         $sheet     = Sheets::sheetName('reviews');
         $voteSheet = Sheets::sheetName('votes');
@@ -320,7 +385,7 @@ final class PublicHandlers
                 }
             }
 
-            $data = Sheets::read($sheet, 'A2:P');
+            $data = Sheets::read($sheet, 'A2:S');
             $idx = null;
             foreach ($data as $i => $r) if (($r[0] ?? '') === $reviewId) {
                 $idx = $i;
@@ -350,16 +415,30 @@ final class PublicHandlers
 
             $netScore = $helpful - $notHelpful;
             $changed = false;
+            $cycles = (int)($row[18] ?? 0);
 
-            if ($status === 'published' && $netScore <= (int) Config::get('unpublish_threshold')) {
+            // Every archive makes the next rescue harder: -10, then -12, -14.
+            // Without this a coordinated block can rescue on the same night it
+            // archived, and the entry oscillates instead of settling.
+            $rescueAt = (int) Config::get('rescue_threshold')
+                + (int) Config::get('rescue_hysteresis_step') * $cycles;
+
+            // Votes still count for a brand-new entry, but they cannot change
+            // its status until the quarantine expires. A publish-time brigade
+            // therefore buries nothing; it just shows up in the numbers for an
+            // admin to see. The entry is published immediately either way.
+            $age = time() - (strtotime((string)($row[1] ?? '')) ?: time());
+            $settling = $age < (int) Config::get('quarantine_seconds');
+
+            if (!$settling && $status === 'published' && $netScore <= (int) Config::get('unpublish_threshold')) {
                 $status = 'archived';
+                $cycles++;
                 $changed = true;
                 Audit::log([
                     'reviewId' => $reviewId,
                     'productName' => (string)($row[11] ?? ''),
                     'productUrl' => (string)($row[2] ?? ''),
                     'stars' => (int)($row[4] ?? 0),
-                    'reviewText' => mb_substr(Crypto::decrypt((string)($row[5] ?? '')), 0, 240),
                     'reportCount' => $reportCount,
                     'actionType' => 'archived',
                     'actor' => 'community',
@@ -367,8 +446,9 @@ final class PublicHandlers
                     'contentHash' => (string)($row[14] ?? ''),
                 ]);
             } elseif (
-                $status === 'archived'
-                && $netScore >= (int) Config::get('rescue_threshold')
+                !$settling
+                && $status === 'archived'
+                && $netScore >= $rescueAt
                 && $reportCount < (int) Config::get('report_ceiling')
             ) {
                 $status = 'published';
@@ -378,11 +458,10 @@ final class PublicHandlers
                     'productName' => (string)($row[11] ?? ''),
                     'productUrl' => (string)($row[2] ?? ''),
                     'stars' => (int)($row[4] ?? 0),
-                    'reviewText' => mb_substr(Crypto::decrypt((string)($row[5] ?? '')), 0, 240),
                     'reportCount' => $reportCount,
                     'actionType' => 'rescued',
                     'actor' => 'community',
-                    'reason' => 'Net Score recovered to ' . $netScore,
+                    'reason' => 'Net Score recovered to ' . $netScore . ' (needed ' . $rescueAt . ')',
                     'contentHash' => (string)($row[14] ?? ''),
                 ]);
             }
@@ -391,13 +470,17 @@ final class PublicHandlers
             // would silently re-open the vote, which is the whole point.
             Sheets::append($voteSheet, [$voterKey, $reviewId, $voteType, time()], 'RAW');
 
-            // Write G, H, I, J, M back
-            Sheets::batchWrite($sheet, [
+            // Write G, H, I, J, M back (and S whenever a cycle was recorded)
+            $updates = [
                 ['range' => "G{$rowNum}:H{$rowNum}", 'values' => [[$helpful, $notHelpful]]],
                 ['range' => "I{$rowNum}", 'values' => [[$netScore]]],
                 ['range' => "J{$rowNum}", 'values' => [[$status]]],
                 ['range' => "M{$rowNum}", 'values' => [[Time::nowIso()]]],
-            ]);
+            ];
+            if ($changed && $status === 'archived') {
+                $updates[] = ['range' => "S{$rowNum}", 'values' => [[$cycles]]];
+            }
+            Sheets::batchWrite($sheet, $updates);
 
             Response::ok([
                 'helpful' => $helpful,
@@ -413,6 +496,16 @@ final class PublicHandlers
             flock($lock, LOCK_UN);
             fclose($lock);
         }
+    }
+
+    /** Voter identity for one entry: stable, and unknowable without the key. */
+    private static function voterKey(string $reviewId, string $submitterToken): string
+    {
+        return hash_hmac(
+            'sha256',
+            'vote|' . $reviewId . '|' . $submitterToken,
+            (string) Config::get('encryption_key')
+        );
     }
 
     /** @return resource|false Exclusive per-review mutex; carries no state. */
@@ -440,12 +533,40 @@ final class PublicHandlers
         if ($reviewId === '' || !in_array($reason, $valid, true)) Response::error('Invalid parameters.');
         if (mb_strlen($text) < 5) Response::error('Please describe the issue (at least 5 characters).');
 
-        if (!RateLimit::checkHourly('report', $req->submitterToken, (int) Config::get('report_per_hour'))) {
-            Response::error('Too many reports in the last hour.');
+        // Cheap guards first, in the order they cost us something. The site-wide
+        // ceiling is file-backed, the captcha is a single HTTPS call, and only
+        // then do we spend Google Sheet quota. Verifying before the per-visitor
+        // tier also means a bot that fails the captcha neither burns the quota
+        // nor eats the visitor's own hourly budget.
+        if (!RateLimit::checkLocal('global:report', (int) (Config::get('global_caps', [])['report'] ?? 0), 3600)) {
+            Response::error('The site is busy right now. Please try again in a few minutes.', 503);
+        }
+
+        $ts = Turnstile::verify($token, 'report', $req->ip);
+        if (!$ts['ok']) Response::error('Verification failed (' . $ts['reason'] . ').');
+
+        // Tiered per-visitor budget. Reports 1..report_per_hour in an hour are
+        // cheap; once a visitor has filed more than report_tier_free in a day
+        // they drop to report_tier_slow per hour with report_tier_slow_seconds
+        // of spacing, so sweeping the whole site takes days rather than hours.
+        $daily = RateLimit::hitCount('report', $req->submitterToken, 86400);
+        $heavy = $daily > (int) Config::get('report_tier_free');
+        $quota = RateLimit::checkSpaced(
+            'report',
+            $req->submitterToken,
+            $heavy ? (int) Config::get('report_tier_slow') : (int) Config::get('report_per_hour'),
+            3600,
+            $heavy ? (int) Config::get('report_tier_slow_seconds') : 0
+        );
+        if ($quota === 'gap') {
+            Response::error('You have filed several reports recently. Please wait before reporting again.', 429);
+        }
+        if ($quota !== 'ok') {
+            Response::error('Too many reports in the last hour.', 429);
         }
 
         $sheet = Sheets::sheetName('reviews');
-        $data  = Sheets::read($sheet, 'A2:P');
+        $data  = Sheets::read($sheet, 'A2:S');
 
         $idx = null;
         foreach ($data as $i => $r) if (($r[0] ?? '') === $reviewId) {
@@ -457,11 +578,27 @@ final class PublicHandlers
         $row = $data[$idx];
         $rowNum = $idx + 2;
 
-        // One global cooldown per review/reply ID prevents mass reporting.
-        $reports = Sheets::read(Sheets::sheetName('reports'), 'A2:F');
+        $reportSheet = Sheets::sheetName('reports');
+        $header = Sheets::read($reportSheet, 'A1:G');
+        if (($header[0][6] ?? '') !== 'reporter_key') {
+            Sheets::setCell($reportSheet, 'G1', 'reporter_key');
+        }
+
+        // Two separate brakes on the same entry: nobody reports it twice, and
+        // nobody at all can for report_cooldown_seconds. Together they cap how
+        // fast any single entry can be driven to the ceiling.
+        $reporterKey = hash_hmac(
+            'sha256',
+            'report|' . $reviewId . '|' . $req->submitterToken,
+            (string) Config::get('identity_pepper')
+        );
+        $reports = array_slice($header, 1);
         $latest = 0;
         foreach ($reports as $r) {
             if (($r[2] ?? '') !== $reviewId) continue;
+            if ((string) ($r[6] ?? '') === $reporterKey) {
+                Response::error('You have already reported this entry.', 409);
+            }
             $t = strtotime((string)($r[1] ?? ''));
             if ($t !== false && $t > $latest) $latest = $t;
         }
@@ -469,26 +606,28 @@ final class PublicHandlers
             Response::error('This entry was reported recently. Please wait a while before reporting it again.');
         }
 
-        $ts = Turnstile::verify($token, 'report', $req->ip);
-        if (!$ts['ok']) Response::error('Verification failed (' . $ts['reason'] . ').');
-
         $rc = (int)($row[10] ?? 0) + 1;
         $reviewUpdates = [
             ['range' => "K{$rowNum}", 'values' => [[$rc]]],
         ];
-        Sheets::append(Sheets::sheetName('reports'), [
+        Sheets::append($reportSheet, [
             Ids::make('REP'),
             Time::nowIso(),
             $reviewId,
             (string)($row[2] ?? ''),
             $reason,
             $text,
+            $reporterKey,
         ]);
 
         $status = Validator::status($row[9] ?? '');
         $autoArchived = false;
         if ($rc >= (int) Config::get('report_ceiling') && $status !== 'archived') {
             $reviewUpdates[] = ['range' => "J{$rowNum}", 'values' => [['archived']]];
+            // Report-driven archives raise the rescue bar exactly like
+            // vote-driven ones, so a re-flagged entry cannot be rescued by the
+            // same block that got it archived.
+            $reviewUpdates[] = ['range' => "S{$rowNum}", 'values' => [[(int)($row[18] ?? 0) + 1]]];
             $autoArchived = true;
         }
         Sheets::batchWrite($sheet, $reviewUpdates);
@@ -498,7 +637,6 @@ final class PublicHandlers
             'productName' => (string)($row[11] ?? ''),
             'productUrl' => (string)($row[2] ?? ''),
             'stars' => (int)($row[4] ?? 0),
-            'reviewText' => mb_substr(Crypto::decrypt((string)($row[5] ?? '')), 0, 240),
             'reportCount' => $rc,
             'actionType' => $autoArchived ? 'flagged_and_archived' : 'flag_received',
             'actor' => 'community',
@@ -519,9 +657,6 @@ final class PublicHandlers
         $data = $req->payload['data'] ?? [];
         $token = (string)($req->payload['turnstileToken'] ?? '');
 
-        $ts = Turnstile::verify($token, 'grievance', $req->ip);
-        if (!$ts['ok']) Response::error('Verification failed (' . $ts['reason'] . ').');
-
         $reviewId = Validator::sanitize($data['reviewId'] ?? '', 20);
         $category = (string)($data['category'] ?? '');
         $desc     = Validator::sanitize($data['description'] ?? '', (int) Config::get('grievance_desc_max_len'));
@@ -536,6 +671,23 @@ final class PublicHandlers
 
         if (!$anonymous && $email === '') Response::error('Please provide a valid contact email or choose anonymous submission.');
 
+        // Cheap before expensive: the site-wide ceiling costs a local file, the
+        // captcha costs an outbound call, and the per-visitor budget costs
+        // Sheets quota. A malformed or flood request never reaches the next tier.
+        if (!RateLimit::checkLocal('global:grievance', (int) (Config::get('global_caps', [])['grievance'] ?? 0), 3600)) {
+            Response::error('The site is busy right now. Please try again in a few minutes.', 503);
+        }
+
+        $ts = Turnstile::verify($token, 'grievance', $req->ip);
+        if (!$ts['ok']) Response::error('Verification failed (' . $ts['reason'] . ').');
+
+        // Legal complaints are written straight to a Sheet with no review step,
+        // so they needed a per-visitor ceiling of their own; a solved captcha
+        // alone still allowed unlimited rows an hour.
+        if (!RateLimit::checkHourly('grievance', $req->submitterToken, (int) Config::get('grievance_per_hour'))) {
+            Response::error('Too many grievances from this device recently. Please try again later.', 429);
+        }
+
         $now = Time::nowIso();
         $caseId = Ids::make('GRV');
         if ($anonymous) {
@@ -543,7 +695,7 @@ final class PublicHandlers
             Sheets::ensureSheet($sheet, [
                 'caseId', 'filedAt', 'ackAt', 'resolvedAt', 'reviewId', 'category', 'description', 'status', 'resolutionNote',
             ]);
-            Sheets::append($sheet, [$caseId, $now, '', '', $reviewId, $category, $desc, 'received', '']);
+            $caseRow = Sheets::append($sheet, [$caseId, $now, '', '', $reviewId, $category, $desc, 'received', '']);
         } else {
             $sheet = Sheets::sheetName('grievances');
             Sheets::ensureSheet($sheet, [
@@ -558,7 +710,7 @@ final class PublicHandlers
             'status',
             'resolutionNote',
             ]);
-            Sheets::append($sheet, [
+            $caseRow = Sheets::append($sheet, [
             $caseId,
             $now,
             '',
@@ -580,23 +732,46 @@ final class PublicHandlers
             'relatedId' => $caseId,
         ]);
 
-        // Notify the Grievance Officer (best effort)
-        $go = (array) Config::get('grievance_officer', []);
-        if (!empty($go['email']) && !str_contains($go['email'], 'yourdomain.com')) {
-            @mail(
-                $go['email'],
-                '[JantaReview] New grievance ' . $caseId . ' (' . $category . ')',
-                "A new grievance has been filed.\n\n" .
-                    "Case ID:   {$caseId}\n" .
-                    "Filed at:  {$now}\n" .
-                    "Review ID: " . ($reviewId ?: '(not specified)') . "\n" .
-                    "Category:  {$category}\n" .
-                    "From:      " . ($anonymous ? '(anonymous request)' : $email) . "\n\n" .
-                    "Description:\n{$desc}\n",
-                "From: no-reply@yourdomain.com\r\nReply-To: {$email}\r\n"
-            );
+        // Rule 3(2) of the IT (Intermediary Guidelines) Rules: acknowledge a
+        // complaint inside the stated window and act on it inside the next one.
+        // Acknowledgement used to be a claim on a page with nothing behind it,
+        // and the mail that was supposed to back it used PHP's mail() from a
+        // domain nobody owns, so it never left the container.
+        //
+        // Everything here runs after the row exists and nothing here throws: a
+        // failed mail must never cost us the complaint.
+        if (self::sendGrievanceAcknowledgement([
+            'caseId' => $caseId,
+            'filedAt' => $now,
+            'reviewId' => $reviewId,
+            'category' => $category,
+            'description' => $desc,
+            'email' => $email,
+            'anonymous' => $anonymous,
+        ])) {
+            // ackAt is stamped only once the provider accepts the message, so
+            // the column stays a real timestamp rather than an intention.
+            if ($caseRow !== null) {
+                try {
+                    Sheets::setCell($sheet, "C{$caseRow}", $now);
+                } catch (\Throwable $e) {
+                    log_message('error', 'Grievance {case} ack stamp failed: {message}', [
+                        'case' => $caseId,
+                        'message' => $e->getMessage(),
+                    ]);
+                }
+            }
+
+            Audit::log([
+                'reviewId' => $reviewId,
+                'actionType' => 'grievance_acknowledged',
+                'actor' => 'system',
+                'reason' => 'Acknowledgement sent for grievance ' . $caseId,
+                'relatedId' => $caseId,
+            ]);
         }
 
+        $go = (array) Config::get('grievance_officer', []);
         Response::ok([
             'message' => 'Your grievance has been received. Please keep your case ID for follow-up.',
             'caseId' => $caseId,
@@ -604,6 +779,106 @@ final class PublicHandlers
             'acknowledgementSLAHours' => $go['ack_sla_hours'] ?? 24,
             'resolutionSLADays' => $go['resolve_sla_days'] ?? 15,
         ]);
+    }
+
+    /**
+     * Rule 3(2) of the IT (Intermediary Guidelines) Rules: acknowledge a
+     * complaint inside the stated window and act on it inside the next one.
+     * Acknowledgement used to be a claim on a page with nothing behind it, and
+     * the mail that was supposed to back it used PHP's mail() from a domain
+     * nobody owns, so it never left the container.
+     *
+     * ackAt is stamped only when the provider accepted the message, which makes
+     * the column a real timestamp rather than an intention. Everything here is
+     * best effort and runs after the row exists: a mail that fails must never
+     * cost us the complaint, and an exception must not turn a filed grievance
+     * into a 500.
+     */
+    /**
+     * Send the acknowledgement mails for one grievance and report whether at
+     * least one of them was accepted. Stamping ackAt and writing the audit row
+     * stay with the callers, which know whether they are the automatic ack (an
+     * intention) or the admin's own click (a decision).
+     *
+     * @param array{caseId:string,filedAt:string,reviewId:string,category:string,description:string,email:string,anonymous:bool} $case
+     */
+    public static function sendGrievanceAcknowledgement(array $case, bool $forced = false): bool
+    {
+        if (!Mailer::configured()) {
+            return false;
+        }
+        // Public traffic is gated by configuration; an admin pressing the
+        // button has already decided, so that path sends regardless.
+        if (!$forced && !(bool) Config::get('grievance_notify_enabled', false)) {
+            return false;
+        }
+
+        $email = (string) ($case['email'] ?? '');
+        $caseId = (string) $case['caseId'];
+        $filedAt = (string) $case['filedAt'];
+        $reviewId = (string) ($case['reviewId'] ?? '');
+        $category = (string) ($case['category'] ?? '');
+        $description = (string) ($case['description'] ?? '');
+        $anonymous = (bool) ($case['anonymous'] ?? false);
+
+        $go = (array) Config::get('grievance_officer', []);
+        $platform = (string) Config::get('platform_name', 'JantaReview');
+        $ackHours = (int) ($go['ack_sla_hours'] ?? 24);
+        $resolveDays = (int) ($go['resolve_sla_days'] ?? 15);
+        $officerName = trim((string) ($go['name'] ?? ''));
+        $officerEmail = trim((string) ($go['email'] ?? ''));
+        $officerPhone = trim((string) ($go['phone'] ?? ''));
+
+        $signature = 'Grievance Officer' . ($officerName !== '' ? ' — ' . $officerName : '') . "\n" . $platform;
+        if ($officerEmail !== '') $signature .= "\n" . $officerEmail;
+        if ($officerPhone !== '') $signature .= "\n" . $officerPhone;
+
+        $acknowledged = false;
+
+        // The sample config ships a placeholder officer address, and .env still
+        // holds one. Forwarding a live complaint there would hand its contents
+        // to whoever runs that domain.
+        $officerReachable = $officerEmail !== '' && !in_array(
+            strtolower(substr(strrchr($officerEmail, '@'), 1) ?: ''),
+            ['yourdomain.com', 'example.com', 'example.org', 'example.net', 'test.com'],
+            true
+        );
+
+        if ($officerReachable) {
+            $acknowledged = Mailer::send(
+                $officerEmail,
+                '[' . $platform . '] Grievance ' . $caseId . ' received (' . $category . ')',
+                "A new grievance has been filed.\n\n"
+                    . "Case ID:   {$caseId}\n"
+                    . "Filed at:  {$filedAt}\n"
+                    . "Review ID: " . ($reviewId !== '' ? $reviewId : '(not specified)') . "\n"
+                    . "Category:  {$category}\n"
+                    . "From:      " . ($anonymous ? '(anonymous request)' : $email) . "\n\n"
+                    . "Description:\n{$description}\n"
+            ) || $acknowledged;
+        }
+
+        if (!$anonymous && $email !== '') {
+            $acknowledged = Mailer::send(
+                $email,
+                'We have received your grievance (' . $caseId . ')',
+                "Your grievance has been recorded.\n\n"
+                    . "Case ID:  {$caseId}\n"
+                    . "Filed:    {$filedAt}\n"
+                    . "Category: {$category}\n"
+                    . "About:    " . ($reviewId !== '' ? $reviewId : '(not specified)') . "\n\n"
+                    . "It has been forwarded to the Grievance Officer of {$platform}. Complaints of this "
+                    . "kind are acknowledged within {$ackHours} hours and resolved within {$resolveDays} "
+                    . "days of being received. Please quote the case ID above in any follow-up.\n\n"
+                    . $signature . "\n"
+            ) || $acknowledged;
+        }
+
+        if (!$acknowledged) {
+            log_message('error', 'Grievance {case} could not be acknowledged by mail', ['case' => $caseId]);
+        }
+
+        return $acknowledged;
     }
 
     public static function submitSuggestion(Request $req): never
@@ -615,6 +890,9 @@ final class PublicHandlers
 
         if (!in_array($category, $valid, true)) Response::error('Invalid suggestion category.');
         if (mb_strlen($text) < 10) Response::error('Please provide at least 10 characters.');
+        if (!RateLimit::checkLocal('global:suggestion', (int) (Config::get('global_caps', [])['suggestion'] ?? 0), 3600)) {
+            Response::error('The site is busy right now. Please try again in a few minutes.', 503);
+        }
         if (!RateLimit::checkHourly('suggestion', $req->submitterToken, 5)) {
             Response::error('Too many suggestions. Please try again later.', 429);
         }
@@ -632,14 +910,14 @@ final class PublicHandlers
 
     public static function getTransparencyLog(): never
     {
-        Response::ok(['log' => Audit::all(500)]);
+        Response::ok(['log' => Audit::publicAll(500)]);
     }
 
     public static function getReviewHistory(Request $req): never
     {
         $reviewId = Validator::sanitize($req->payload['reviewId'] ?? '', 20);
         if ($reviewId === '') Response::error('Missing reviewId.');
-        Response::ok(['reviewId' => $reviewId, 'history' => Audit::forReview($reviewId)]);
+        Response::ok(['reviewId' => $reviewId, 'history' => Audit::publicForReview($reviewId)]);
     }
 
     public static function getTransparencyReport(): never
@@ -684,6 +962,9 @@ final class PublicHandlers
             'compliance' => [
                 'retentionPolicyDays' => (int) Config::get('retention_days'),
             ],
+            // null until the nightly job has run at least once: the page must
+            // not claim an integrity check that has not happened.
+            'logIntegrity' => Audit::integrity(),
         ]);
     }
 
@@ -759,7 +1040,7 @@ final class PublicHandlers
             'jurisdiction' => (string) Config::get('jurisdiction'),
             'legal' => [
                 'intermediaryStatus' => 'Operates as an intermediary under Section 79 of the IT Act, 2000.',
-                'intermediaryRules' => 'Complies with the IT (Intermediary Guidelines and Digital Media Ethics Code) Rules, 2021.',
+                'intermediaryRules' => 'Operated with reference to the IT (Intermediary Guidelines and Digital Media Ethics Code) Rules, 2021.',
                 'dpdp' => 'Review emails are used only for one-time verification and are not stored with review data.',
                 'retentionPolicyDays' => (int) Config::get('retention_days'),
             ],
@@ -814,40 +1095,12 @@ final class PublicHandlers
         ]);
     }
 
+    /**
+     * Store label for the review card. ProductLink owns the domain list so a
+     * badge and a link verdict can never disagree about who "Amazon" is.
+     */
     private static function detectStore(string $host): ?string
     {
-        if ($host === '') return null;
-        $h = strtolower($host);
-        $stores = [
-            'amazon.' => 'Amazon',
-            'amzn.' => 'Amazon',
-            'flipkart.' => 'Flipkart',
-            'myntra.' => 'Myntra',
-            'ajio.' => 'AJIO',
-            'meesho.' => 'Meesho',
-            'snapdeal.' => 'Snapdeal',
-            'nykaa.' => 'Nykaa',
-            'croma.' => 'Croma',
-            'reliancedigital.' => 'Reliance Digital',
-            'tatacliq.' => 'Tata CLiQ',
-            'jiomart.' => 'JioMart',
-            'paytmmall.' => 'Paytm Mall',
-            'shopclues.' => 'ShopClues',
-            'bigbasket.' => 'BigBasket',
-            'blinkit.' => 'Blinkit',
-            'zepto.' => 'Zepto',
-            'dmart.' => 'DMart',
-            'lenskart.' => 'Lenskart',
-            'pepperfry.' => 'Pepperfry',
-            'firstcry.' => 'FirstCry',
-            'ebay.' => 'eBay',
-            'aliexpress.' => 'AliExpress',
-            'walmart.' => 'Walmart',
-            'etsy.' => 'Etsy',
-        ];
-        foreach ($stores as $needle => $name) {
-            if (str_contains($h, $needle)) return $name;
-        }
-        return null;
+        return ProductLink::storeFor($host);
     }
 }

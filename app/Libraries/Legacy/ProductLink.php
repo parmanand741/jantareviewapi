@@ -19,6 +19,12 @@ use GuzzleHttp\Exception\TransferException;
  *                syntax, the store's homepage, a search/browse page, a domain
  *                that no longer exists, or an address on a private network.
  *
+ * A link that already carries a store's own product-page shape is valid on its
+ * own terms. The probe can only add a title and image to it, or prove the
+ * address dead: Amazon serves a "continue shopping" interstitial to this
+ * request from most server IPs, and reading that as a bad link told Indian
+ * shoppers that their genuine product pages were not products.
+ *
  * The probe talks to the resolved IP directly (CURLOPT_RESOLVE) and re-runs
  * every guard on each redirect hop, so this endpoint cannot be aimed at
  * internal addresses.
@@ -64,7 +70,7 @@ final class ProductLink
 
     /** Matched against the path + query (never the host), always lowercased. */
     private const PRODUCT_PATTERNS = [
-        'Amazon'     => ['~/(dp|gp/product|gp/aw/d|gp/aod|gp/offer-listing|product-reviews|gp/aw/customer-reviews)(/|$)~', '~[?&]asin=[a-z0-9]{10}~'],
+        'Amazon'     => ['~/(?:dp|gp/product|gp/aw/d|gp/aod|gp/offer-listing|product-reviews|gp/aw/customer-reviews)/[a-z0-9]{10}(?:/|$|\\?)~', '~[?&]asin=[a-z0-9]{10}~'],
         'Flipkart'   => ['~/p/itm[0-9a-f]+~', '~[?&]pid=[a-z0-9]+~', '~/product-reviews/~', '~/askadifference/~'],
         'Meesho'     => ['~/p/[a-z0-9]+~', '~/catalog/~'],
         'Ajio'       => ['~/p/[0-9]+~', '~/product/~'],
@@ -81,12 +87,61 @@ final class ProductLink
         'TataCLiQ'   => ['~/p/[^/]+/[0-9]+~', '~/[a-z0-9%-]+\.html~'],
     ];
 
+    /**
+     * Registrable domains per vendor, matched as a whole label or a subdomain —
+     * never as a substring. "amazon.deals-hub.test" contains "amazon" the way a
+     * phishing page does, and a page like that must not earn our product-page
+     * shape rules or an "Amazon" badge.
+     */
     private const VENDOR_HOSTS = [
-        'Amazon' => 'amazon', 'Flipkart' => 'flipkart', 'Meesho' => 'meesho',
-        'Ajio' => 'ajio', 'Myntra' => 'myntra', 'Snapdeal' => 'snapdeal',
-        'Croma' => 'croma', 'Nykaa' => 'nykaa', 'eBay' => 'ebay',
-        'AliExpress' => 'aliexpress', 'Walmart' => 'walmart', 'BestBuy' => 'bestbuy',
-        'Apple' => 'apple.com', 'Samsung' => 'samsung.com', 'TataCLiQ' => 'tatacliq',
+        'Amazon'     => ['amazon.in', 'amazon.com', 'amazon.co.uk', 'amazon.ca', 'amazon.de',
+                         'amazon.fr', 'amazon.es', 'amazon.it', 'amazon.nl', 'amazon.sg',
+                         'amazon.com.au', 'amazon.com.br', 'amazon.ae', 'amazon.co.jp', 'amzn.to'],
+        'Flipkart'   => ['flipkart.com', 'flipkart.in'],
+        'Meesho'     => ['meesho.com', 'meesho.in'],
+        'Ajio'       => ['ajio.com', 'ajio.info'],
+        'Myntra'     => ['myntra.com', 'myntraweb.com'],
+        'Snapdeal'   => ['snapdeal.com'],
+        'Croma'      => ['croma.com'],
+        'Nykaa'      => ['nykaa.com', 'nykaaman.com'],
+        'eBay'       => ['ebay.com', 'ebay.in', 'ebay.co.uk'],
+        'AliExpress' => ['aliexpress.com', 'aliexpress.us'],
+        'Walmart'    => ['walmart.com'],
+        'BestBuy'    => ['bestbuy.com'],
+        'Apple'      => ['apple.com'],
+        'Samsung'    => ['samsung.com', 'samsung.in'],
+        'TataCLiQ'   => ['tatacliq.com'],
+    ];
+
+    /** Store labels shown in the public feed, keyed the same way as above. */
+    private const STORE_BADGES = [
+        'amazon.in' => 'Amazon', 'amazon.com' => 'Amazon', 'amazon.co.uk' => 'Amazon',
+        'amazon.ca' => 'Amazon', 'amazon.de' => 'Amazon', 'amazon.fr' => 'Amazon',
+        'amazon.es' => 'Amazon', 'amazon.it' => 'Amazon', 'amazon.nl' => 'Amazon',
+        'amazon.sg' => 'Amazon', 'amazon.com.au' => 'Amazon', 'amazon.com.br' => 'Amazon',
+        'amazon.ae' => 'Amazon', 'amazon.co.jp' => 'Amazon', 'amzn.to' => 'Amazon',
+        'flipkart.com' => 'Flipkart', 'flipkart.in' => 'Flipkart',
+        'myntra.com' => 'Myntra', 'myntraweb.com' => 'Myntra',
+        'ajio.com' => 'AJIO', 'ajio.info' => 'AJIO',
+        'meesho.com' => 'Meesho', 'meesho.in' => 'Meesho',
+        'snapdeal.com' => 'Snapdeal',
+        'nykaa.com' => 'Nykaa', 'nykaaman.com' => 'Nykaa',
+        'croma.com' => 'Croma',
+        'reliancedigital.in' => 'Reliance Digital',
+        'tatacliq.com' => 'Tata CLiQ',
+        'jiomart.com' => 'JioMart',
+        'paytmmall.com' => 'Paytm Mall',
+        'shopclues.com' => 'ShopClues',
+        'bigbasket.com' => 'BigBasket', 'blinkit.com' => 'Blinkit',
+        'zeptonow.com' => 'Zepto', 'dmartready.com' => 'DMart',
+        'lenskart.com' => 'Lenskart', 'pepperfry.com' => 'Pepperfry',
+        'firstcry.com' => 'FirstCry',
+        'ebay.com' => 'eBay', 'ebay.in' => 'eBay', 'ebay.co.uk' => 'eBay',
+        'aliexpress.com' => 'AliExpress', 'aliexpress.us' => 'AliExpress',
+        'walmart.com' => 'Walmart',
+        'etsy.com' => 'Etsy',
+        'bestbuy.com' => 'Best Buy',
+        'apple.com' => 'Apple', 'samsung.com' => 'Samsung', 'samsung.in' => 'Samsung',
     ];
 
     /** Titles that mean the server answered 200 with an error page. */
@@ -135,6 +190,25 @@ final class ProductLink
     public static function inspect(string $url, bool $probe = true): array
     {
         $structure = self::structure($url);
+
+        if ($structure['verdict'] === self::VALID) {
+            if (!$probe) return $structure;
+
+            $probed = self::probe($url);
+            // Only what is provable about the address itself can overrule a real
+            // product shape: a domain that has gone, or one that dials a private
+            // network. Both come back from probe() as INVALID.
+            if ($probed['verdict'] === self::INVALID) return $probed;
+            // Reaching the actual page is strictly better — it carries the title
+            // and image the reviewer sees in the preview.
+            if ($probed['verdict'] === self::VALID) return $probed;
+
+            // A bot wall, an interstitial or a timeout is a verdict about our
+            // server, not about the link, so keep the structural answer and
+            // record that nothing was confirmed.
+            return array_merge($structure, ['code' => 'structure_only', 'probeCode' => $probed['code']]);
+        }
+
         if (!$probe || $structure['verdict'] === self::INVALID) {
             return $structure;
         }
@@ -523,9 +597,16 @@ final class ProductLink
         return preg_match($pattern, $subject, $m) === 1 && $m[1] !== '' ? $m[1] : null;
     }
 
+    /**
+     * A page's own title is attacker text, and it arrives entity-encoded, so
+     * decoding has to come first: "&lt;img onerror=…&gt;" survives strip_tags()
+     * untouched and only becomes markup on the way out.
+     */
     private static function clean(string $raw, int $max): string
     {
-        $s = html_entity_decode(trim(strip_tags($raw)), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $s = trim(html_entity_decode($raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        $s = trim(strip_tags($s));
+        $s = str_replace(['<', '>', '"', "'"], ' ', $s);
         $s = preg_replace('~[\x{0000}-\x{001F}\x{007F}-\x{009F}]~u', ' ', $s) ?? $s;
         $s = trim(preg_replace('~\s+~u', ' ', $s) ?? $s);
         if (function_exists('iconv')) {
@@ -540,11 +621,33 @@ final class ProductLink
         return (string) Validator::url(html_entity_decode(trim($raw), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
     }
 
+    /** True when $host is $domain itself or a subdomain of it. */
+    private static function isOnDomain(string $host, string $domain): bool
+    {
+        return $host === $domain || str_ends_with($host, '.' . $domain);
+    }
+
+    /**
+     * The label shown on a review card. Display only — nothing about a link's
+     * validity is derived from it, and an unrecognised domain earns no badge.
+     */
+    public static function storeFor(string $host): ?string
+    {
+        $host = strtolower(rtrim(trim($host), '.'));
+        if ($host === '') return null;
+
+        foreach (self::STORE_BADGES as $domain => $badge) {
+            if (self::isOnDomain($host, $domain)) return $badge;
+        }
+        return null;
+    }
+
     private static function vendorFor(string $host): string
     {
-        foreach (self::VENDOR_HOSTS as $vendor => $needle) {
-            if (str_contains($host, $needle)) {
-                return $vendor;
+        $host = strtolower(rtrim($host, '.'));
+        foreach (self::VENDOR_HOSTS as $vendor => $domains) {
+            foreach ($domains as $domain) {
+                if (self::isOnDomain($host, $domain)) return $vendor;
             }
         }
         return '';

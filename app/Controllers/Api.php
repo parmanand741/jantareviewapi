@@ -9,6 +9,7 @@ use App\Libraries\Legacy\Admin;
 use App\Libraries\Legacy\ApiResponseException;
 use App\Libraries\Legacy\Config;
 use App\Libraries\Legacy\PublicHandlers;
+use App\Libraries\Legacy\RateLimit;
 use App\Libraries\Legacy\Otp;
 use App\Libraries\Legacy\Request;
 use CodeIgniter\HTTP\ResponseInterface;
@@ -25,8 +26,21 @@ final class Api extends BaseController
     public function index(): ResponseInterface
     {
         try {
+            // CORS and the baseline security headers are granted before anything
+            // can answer: the admin console probes ?action=health cross-origin on
+            // page load, while it still has no session and no CSRF token.
+            $origin = (string) $this->request->getHeaderLine('Origin');
+            $this->applyCors($origin);
+
+            // An uptime probe has to answer even when the configuration is the
+            // thing that is broken, so this is served before Request — which
+            // loads and validates the whole Review config to derive an identity.
+            if ($this->request->getMethod() === 'GET'
+                && (string) ($this->request->getGet('action') ?? '') === 'health') {
+                PublicHandlers::health();
+            }
+
             $request = new Request($this->request);
-            $this->applyCors($request->origin);
             if ($request->method === 'OPTIONS') {
                 return $this->response->setStatusCode(204);
             }
@@ -38,9 +52,6 @@ final class Api extends BaseController
             }
 
             if ($request->method === 'GET') {
-                if ($request->action === 'health') {
-                    PublicHandlers::health();
-                }
                 if ($request->action === 'csrf') {
                     return $this->json([
                         'success' => true,
@@ -48,9 +59,11 @@ final class Api extends BaseController
                     ], 200);
                 }
                 Config::load();
+                $this->throttleReads($request);
                 $this->dispatchGet($request);
             } elseif ($request->method === 'POST') {
                 Config::load();
+                $this->throttleReads($request);
                 $this->dispatchPost($request);
             } else {
                 \App\Libraries\Legacy\Response::error('Method not allowed.', 405);
@@ -75,6 +88,25 @@ final class Api extends BaseController
         }
 
         return $this->json(['success' => false, 'error' => 'No response.'], 500);
+    }
+
+    /**
+     * Reads are the cheapest way to burn the Google Sheets quota and to scrape
+     * the whole dataset. Capped per address rather than per identifier: a
+     * shared CGNAT exit still gets its own generous budget.
+     */
+    private function throttleReads(Request $request): void
+    {
+        $reads = $request->method === 'GET'
+            ? ['compliance', 'platforms', 'info', '']
+            : ['getReviews', 'getStats', 'getTransparencyLog', 'getReviewHistory', 'getTransparencyReport'];
+
+        if (!in_array($request->action, $reads, true)) {
+            return;
+        }
+        if (!RateLimit::checkLocal('read|' . $request->ip, (int) Config::get('read_per_minute', 120), 60)) {
+            \App\Libraries\Legacy\Response::error('Too many requests from your address. Please slow down.', 429);
+        }
     }
 
     private function dispatchGet(Request $request): never

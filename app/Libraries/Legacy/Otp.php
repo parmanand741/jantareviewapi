@@ -14,6 +14,18 @@ final class Otp
         $email = Validator::email($email);
         if ($email === '') Response::error('Please provide a valid email address.');
 
+        // This endpoint mails an arbitrary address, so it is the natural target
+        // for a mail-bombing script. It used to have no bot gate at all.
+        $ts = Turnstile::verify((string) ($req->payload['turnstileToken'] ?? ''), 'otp', $req->ip);
+        if (!$ts['ok']) Response::error('Bot protection failed (' . $ts['reason'] . ').');
+
+        if (!RateLimit::checkLocal('global:otp', (int) (Config::get('global_caps', [])['otp'] ?? 0), 3600)) {
+            Response::error('The site is busy right now. Please try again in a few minutes.', 503);
+        }
+        if (!RateLimit::checkLocal('otp_ip|' . $req->ip, (int) Config::get('otp_per_ip_per_day', 20), 86400)) {
+            Response::error('Too many verification requests from your address. Please try again tomorrow.', 429);
+        }
+
         self::removeExpired();
         service('session')->set('review_otp_nonce', bin2hex(random_bytes(16)));
         $emailHash = self::digest($email);
@@ -70,12 +82,17 @@ final class Otp
         }
 
         $verificationToken = bin2hex(random_bytes(self::TOKEN_BYTES));
-        service('session')->set('review_otp_verified', [
+        $session = service('session');
+        $session->set('review_otp_verified', [
             'challenge_hash' => self::digest($challengeId),
             'verification_hash' => self::digest($verificationToken),
             'session_hash' => $record['session_hash'],
             'expires_at' => $record['expires_at'],
         ]);
+        // Server-side proof of how long this browser spent on the OTP step.
+        // submitReview refuses to run until the floor has passed, so a script
+        // that solves the whole flow back-to-back cannot post.
+        $session->set('review_otp_verified_at', time());
         self::delete($challengeId);
         Response::ok(['message' => 'Email verified.', 'verificationToken' => $verificationToken]);
     }
@@ -92,7 +109,16 @@ final class Otp
             && (int) ($record['expires_at'] ?? 0) >= time()
             && hash_equals((string) ($record['verification_hash'] ?? ''), self::digest($token));
         if (!$valid) Response::error('Email verification is required or has expired.', 401);
-        service('session')->remove('review_otp_verified');
+
+        $session = service('session');
+        $floor = (int) Config::get('ticket_min_age_seconds', 3);
+        if ($floor > 0 && time() - (int) $session->get('review_otp_verified_at') < $floor) {
+            // The verification stays valid: a real reviewer who is simply quick
+            // can retry a moment later, while a script cannot post at all.
+            Response::error('Please wait a moment before publishing.', 429);
+        }
+        $session->remove('review_otp_verified');
+        $session->remove('review_otp_verified_at');
     }
 
     public static function cleanupExpired(): array
@@ -117,51 +143,11 @@ final class Otp
 
     private static function send(string $to, string $code): bool
     {
-        $from = (string) Config::get('otp_from_email', '');
-        $apiKey = (string) Config::get('mailjet_api_key', '');
-        $secretKey = (string) Config::get('mailjet_secret_key', '');
-        if ($from === '' || $apiKey === '' || $secretKey === '') return false;
-
-        $payload = [
-            'Messages' => [[
-                'From' => [
-                    'Email' => $from,
-                    'Name' => (string) Config::get('otp_from_name', 'JantaReview'),
-                ],
-                'To' => [['Email' => $to]],
-                'Subject' => 'Your JantaReview verification code',
-                'TextPart' => "Your verification code is {$code}.\n\nThis code expires in 10 minutes. If you did not request it, you can ignore this email.",
-            ]],
-        ];
-
-        $curl = \Config\Services::curlrequest();
-        try {
-            $res = $curl->post('https://api.mailjet.com/v3.1/send', [
-                'headers' => [
-                    'Content-Type' => 'application/json',
-                    'Authorization' => 'Basic ' . base64_encode($apiKey . ':' . $secretKey),
-                ],
-                'body' => json_encode($payload),
-                'timeout' => 15,
-                'http_errors' => false,
-                // WAMP PHP ships without curl.cainfo; reuse the same CA discovery
-                // as Sheets. null on Render/Linux means the system store is used.
-                'verify' => Sheets::findCaBundle() ?? true,
-            ]);
-        } catch (\Throwable $e) {
-            log_message('error', 'Mailjet request failed: {message}', ['message' => $e->getMessage()]);
-            return false;
-        }
-
-        if ($res->getStatusCode() !== 200) {
-            log_message('error', 'Mailjet send failed: HTTP {code} {body}', [
-                'code' => $res->getStatusCode(),
-                'body' => (string) $res->getBody(),
-            ]);
-            return false;
-        }
-        $body = json_decode((string) $res->getBody(), true);
-        return (bool) ($body['Messages'][0]['Status'] ?? false);
+        return Mailer::send(
+            $to,
+            'Your JantaReview verification code',
+            "Your verification code is {$code}.\n\nThis code expires in 10 minutes. If you did not request it, you can ignore this email."
+        );
     }
 
     private static function sessionBinding(Request $req): string

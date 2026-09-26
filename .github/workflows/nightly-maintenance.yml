@@ -1,0 +1,79 @@
+# Nightly datastore maintenance: enforce retention, checkpoint the moderation
+# log, then export every tab.
+#
+# Render's free plan has no cron and an ephemeral disk, so the schedule lives
+# here and the CSVs land in this repo's Actions artifacts. The job is inert
+# until BOTH of these are true, which is deliberate: nothing deletes or writes
+# production data until it is switched on in repository settings.
+#
+#   1. Settings → Secrets and variables → Actions → Variables:
+#        MAINTENANCE_ENABLED = true
+#   2. The secrets below exist (same values Render already holds):
+#        GOOGLE_SERVICE_ACCOUNT_JSON  (the service-account file contents)
+#        REVIEW_SPREADSHEET_ID        (non-secret id)
+#        REVIEW_ENCRYPTION_KEY, REVIEW_ADMIN_KEY, TURNSTILE_SECRET
+#      Startup validates the whole set even though these two commands only
+#      read and write the spreadsheet.
+#
+# Run it once by hand from the Actions tab before enabling the schedule.
+
+name: Nightly maintenance
+
+on:
+  schedule:
+    - cron: '35 19 * * *'   # 01:05 IST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  maintain:
+    if: github.event_name == 'workflow_dispatch' || vars.MAINTENANCE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CI_ENVIRONMENT: production
+      GOOGLE_APPLICATION_CREDENTIALS: config/service-account.json
+      REVIEW_SPREADSHEET_ID: ${{ secrets.REVIEW_SPREADSHEET_ID }}
+      REVIEW_ENCRYPTION_KEY: ${{ secrets.REVIEW_ENCRYPTION_KEY }}
+      REVIEW_ADMIN_KEY: ${{ secrets.REVIEW_ADMIN_KEY }}
+      TURNSTILE_SECRET: ${{ secrets.TURNSTILE_SECRET }}
+      REVIEW_ALLOWED_ORIGINS: ${{ vars.REVIEW_ALLOWED_ORIGINS }}
+      REVIEW_TURNSTILE_HOSTS: ${{ vars.REVIEW_TURNSTILE_HOSTS }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: none
+          extensions: curl, json, mbstring, openssl, intl
+
+      - run: composer install --no-interaction --no-progress --prefer-dist --no-scripts
+
+      - name: Place the service-account file outside the web root
+        run: |
+          mkdir -p config
+          printf '%s' "${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}" > config/service-account.json
+
+      - name: Purge rows past the retention period
+        run: php spark security:retention-purge
+
+      - name: Checkpoint the moderation log
+        run: php spark security:audit-checkpoint
+
+      - name: Export every tab
+        run: php spark backup:sheets-export --out=build/backup --keep=3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sheet-export
+          path: build/backup
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Wipe the credential off the runner
+        if: always()
+        run: rm -f config/service-account.json

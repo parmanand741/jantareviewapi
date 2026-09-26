@@ -15,6 +15,7 @@ class Review extends BaseConfig
     public string $spreadsheetId = '';
     public string $credentialsPath = '';
     public string $encryptionKey = '';
+    public string $identityPepper = '';
     public string $adminKey = '';
     public string $turnstileSecret = '';
     public bool $allowLocalTurnstileBypass = false;
@@ -40,25 +41,50 @@ class Review extends BaseConfig
         'suggestions' => 'Suggestions',
         'rateLimits' => 'Rate_Limits',
         'votes' => 'Votes',
+        'integrityChecks' => 'Integrity_Checks',
     ];
     public int $unpublishThreshold = -15;
     public int $rescueThreshold = -10;
     public int $reportCeiling = 15;
     public int $voteCooldownSeconds = 60;
-    public int $reportCooldownSeconds = 3600;
+    public int $reportCooldownSeconds = 18000;
     public int $submitPerHour = 20;
-    public int $reportPerHour = 30;
+    public int $reportPerHour = 5;
     public int $votePerHour = 10;
     public int $linkCheckPerHour = 25;
+    public int $voteUserCooldownSeconds = 300;
+    public int $reportTierFree = 5;
+    public int $reportTierSlow = 1;
+    public int $reportTierSlowSeconds = 18000;
+    public int $rescueHysteresisStep = 2;
+    public int $readPerMinute = 120;
+    public int $otpPerIpPerDay = 20;
+    public int $ticketMinAgeSeconds = 3;
+    public int $quarantineSeconds = 1800;
+    public int $dedupeWindowSeconds = 86400;
+    public array $globalCaps = [
+        'submit' => 300,
+        'vote' => 3000,
+        'report' => 600,
+        'urlcheck' => 600,
+        'suggestion' => 300,
+        'grievance' => 200,
+        'otp' => 400,
+    ];
+    public array $adminAllowedIps = [];
+    public int $adminTtlSeconds = 1800;
+    public bool $grievanceNotifyEnabled = false;
     public int $reviewPlainMaxLen = 500;
     public int $reviewEncMaxLen = 16000;
     public int $productNameMaxLen = 200;
     public int $reportReasonMaxLen = 500;
     public int $grievanceDescMinLen = 20;
     public int $grievanceDescMaxLen = 500;
+    public int $grievancePerHour = 3;
     public string $platformName = 'JantaReview';
     public string $jurisdiction = 'India';
     public int $retentionDays = 90;
+    public int $auditRetentionDays = 180;
     public array $grievanceOfficer = [];
     public string $storagePath = WRITEPATH . 'review';
     public bool $debug = false;
@@ -72,6 +98,7 @@ class Review extends BaseConfig
             (string) env('GOOGLE_APPLICATION_CREDENTIALS', '')
         );
         $this->encryptionKey = (string) env('REVIEW_ENCRYPTION_KEY', '');
+        $this->identityPepper = (string) env('REVIEW_IDENTITY_PEPPER', '');
         $this->adminKey = (string) env('REVIEW_ADMIN_KEY', '');
         $this->turnstileTestMode = filter_var(env('TURNSTILE_USE_TEST_KEYS', false), FILTER_VALIDATE_BOOLEAN);
         $this->turnstileSecret = $this->turnstileTestMode
@@ -92,20 +119,36 @@ class Review extends BaseConfig
         $this->rescueThreshold = (int) env('REVIEW_RESCUE_THRESHOLD', -10);
         $this->reportCeiling = (int) env('REVIEW_REPORT_CEILING', 15);
         $this->voteCooldownSeconds = (int) env('REVIEW_VOTE_COOLDOWN_SECONDS', 60);
-        $this->reportCooldownSeconds = (int) env('REVIEW_REPORT_COOLDOWN_SECONDS', 3600);
+        $this->reportCooldownSeconds = (int) env('REVIEW_REPORT_COOLDOWN_SECONDS', 18000);
         $this->submitPerHour = (int) env('REVIEW_SUBMIT_PER_HOUR', 20);
-        $this->reportPerHour = (int) env('REVIEW_REPORT_PER_HOUR', 30);
+        $this->reportPerHour = (int) env('REVIEW_REPORT_PER_HOUR', 5);
         $this->votePerHour = (int) env('REVIEW_VOTE_PER_HOUR', 10);
         $this->linkCheckPerHour = (int) env('REVIEW_LINK_CHECK_PER_HOUR', 25);
+        $this->voteUserCooldownSeconds = (int) env('REVIEW_VOTE_USER_COOLDOWN_SECONDS', 300);
+        $this->reportTierFree = (int) env('REVIEW_REPORT_TIER_FREE', 5);
+        $this->reportTierSlow = (int) env('REVIEW_REPORT_TIER_SLOW', 1);
+        $this->reportTierSlowSeconds = (int) env('REVIEW_REPORT_TIER_SLOW_SECONDS', 18000);
+        $this->rescueHysteresisStep = (int) env('REVIEW_RESCUE_HYSTERESIS_STEP', 2);
+        $this->readPerMinute = (int) env('REVIEW_READ_PER_MINUTE', 120);
+        $this->otpPerIpPerDay = (int) env('REVIEW_OTP_PER_IP_PER_DAY', 20);
+        $this->ticketMinAgeSeconds = (int) env('REVIEW_TICKET_MIN_AGE_SECONDS', 3);
+        $this->quarantineSeconds = (int) env('REVIEW_QUARANTINE_SECONDS', 1800);
+        $this->dedupeWindowSeconds = (int) env('REVIEW_DEDUPE_WINDOW_SECONDS', 86400);
+        $this->globalCaps = $this->intMap('REVIEW_GLOBAL_CAPS', $this->globalCaps);
+        $this->adminAllowedIps = $this->csv('REVIEW_ADMIN_ALLOWED_IPS');
+        $this->adminTtlSeconds = (int) env('REVIEW_ADMIN_TTL_SECONDS', 1800);
+        $this->grievanceNotifyEnabled = filter_var(env('GRIEVANCE_NOTIFY_ENABLED', false), FILTER_VALIDATE_BOOLEAN);
         $this->reviewPlainMaxLen = (int) env('REVIEW_PLAIN_MAX_LEN', 500);
         $this->reviewEncMaxLen = (int) env('REVIEW_ENCRYPTED_MAX_LEN', 16000);
         $this->productNameMaxLen = (int) env('REVIEW_PRODUCT_NAME_MAX_LEN', 200);
         $this->reportReasonMaxLen = (int) env('REVIEW_REPORT_REASON_MAX_LEN', 500);
         $this->grievanceDescMinLen = (int) env('REVIEW_GRIEVANCE_DESC_MIN_LEN', 20);
         $this->grievanceDescMaxLen = (int) env('REVIEW_GRIEVANCE_DESC_MAX_LEN', 500);
+        $this->grievancePerHour = (int) env('REVIEW_GRIEVANCE_PER_HOUR', 3);
         $this->platformName = (string) env('REVIEW_PLATFORM_NAME', 'JantaReview');
         $this->jurisdiction = (string) env('REVIEW_JURISDICTION', 'India');
         $this->retentionDays = (int) env('REVIEW_RETENTION_DAYS', 90);
+        $this->auditRetentionDays = (int) env('REVIEW_AUDIT_RETENTION_DAYS', 180);
         $this->storagePath = (string) env('REVIEW_STORAGE_PATH', WRITEPATH . 'review');
         $this->debug = filter_var(env('CI_DEBUG', false), FILTER_VALIDATE_BOOLEAN);
 
@@ -124,6 +167,19 @@ class Review extends BaseConfig
     {
         $value = trim((string) env($key, ''));
         return $value === '' ? [] : array_values(array_filter(array_map('trim', explode(',', $value))));
+    }
+
+    /** "scope=12,other=3" merged over defaults; a zero value disables that ceiling. */
+    private function intMap(string $key, array $defaults): array
+    {
+        $map = $defaults;
+        foreach ($this->csv($key) as $pair) {
+            [$scope, $value] = array_pad(explode('=', $pair, 2), 2, '');
+            if ($scope !== '' && $value !== '' && is_numeric($value) && isset($map[$scope])) {
+                $map[$scope] = (int) $value;
+            }
+        }
+        return $map;
     }
 
     private function resolveCredentialsPath(string $configured): string

@@ -10,6 +10,9 @@
 !.env.example
 **/service-account*.json
 **/*credentials*.json
+key.txt
+*_secrete.txt
+*_secret.txt
 
 # Dependencies are installed fresh inside the image (Linux), so skip local vendor.
 vendor/

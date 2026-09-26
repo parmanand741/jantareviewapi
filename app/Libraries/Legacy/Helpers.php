@@ -185,6 +185,9 @@ final class Validator
         if (preg_match('/^(127\.|10\.|192\.168\.|169\.254\.|0\.)/', $host)) return '';
         if (preg_match('/^172\.(1[6-9]|2\d|3[01])\./', $host)) return '';
         if (!preg_match('/\.[a-z]{2,}$/i', $host)) return '';
+        // Shops answer on 443 and ProductLink::probe refuses any other port, so
+        // a link stored with one would be a link whose target was never checked.
+        if (!empty($p['port']) && (int) $p['port'] !== 443) return '';
 
         // Strip tracking params
         $tracking = [
@@ -242,9 +245,8 @@ final class Validator
             }
         }
         $q = $keep ? '?' . implode('&', $keep) : '';
-        $port = !empty($p['port']) ? ':' . $p['port'] : '';
         $path = $p['path'] ?? '/';
-        return 'https://' . $host . $port . $path . $q;
+        return 'https://' . $host . $path . $q;
     }
 
     public static function stars(mixed $raw): int
